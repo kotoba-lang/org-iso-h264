@@ -104,9 +104,36 @@
    1:1 from `ff_h264_luma_dc_dequant_idct` (including its exact `x_offset`
    index arithmetic) since that arithmetic IS the block-index mapping —
    re-deriving it independently risks a subtly different (but
-   self-consistent-looking) mapping that silently mismatches ffmpeg's."
+   self-consistent-looking) mapping that silently mismatches ffmpeg's.
+
+   IMPORTANT internal convention, analogous to `inverse-4x4`'s own
+   documented transpose: `dc-raster` is accepted in normal row-major order
+   (matching how `h264.decode`'s zigzag-unscanned DC coefficients are
+   naturally laid out), but FFmpeg's `ff_h264_luma_dc_dequant_idct` reads
+   its `input[]` in a column-major sense relative to that (same underlying
+   reason as `inverse-4x4`'s transpose — this is a SEPARATE transform from
+   the regular 4x4 residual one, so it needed its OWN transpose, which
+   wasn't applied when this function was first ported). This went
+   undetected through the chroma-decode/multi-MB-V/H-prediction
+   development session because every fixture up to that point had luma DC
+   content that's symmetric under transpose (flat, or a single-MB gradient
+   with only one real spatial axis of variation) — no fixture had
+   multi-macroblock luma content varying by ROW (not column) with real
+   per-block DC energy to distinguish the two. It was caught by a real
+   x264-encoded multi-macroblock stream (libx264 selected Intra_16x16
+   Horizontal prediction) whose luma content varies by row: without this
+   transpose, the DC-Hadamard output varies along the WRONG screen axis
+   (by column instead of by row) regardless of which
+   `h264.decode/blk->col-row` block-index mapping is used — this bug and
+   the `blk->col-row` column-major-vs-raster bug are independent and both
+   had to be fixed together (fixing only one still fails: e.g. transposing
+   only this input, while `blk->col-row` still used its old wrong mapping,
+   produced a THIRD wrong permutation, not a partial improvement).
+   `luma-dc-hadamard` transposes internally so callers can keep passing
+   plain row-major 4x4 grids, exactly like `inverse-4x4` does."
   [dc-raster qmul]
-  (let [in (fn [i] (nth dc-raster i))
+  (let [dc-raster (transpose16 dc-raster)
+        in (fn [i] (nth dc-raster i))
         tmp (vec (repeat 16 0))
         tmp (reduce
              (fn [acc i]

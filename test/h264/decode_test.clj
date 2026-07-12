@@ -45,7 +45,15 @@
    own docstring in `chroma-multimb32-golden-vector` below for how it was
    generated and what it exercises (real chroma AC + multi-macroblock
    cross-MB neighbor derivation + multiple distinct luma/chroma prediction
-   modes actually selected by a real encoder)."
+   modes actually selected by a real encoder).
+
+   `horizontal-multimb64.h264` (64x64, 4x4=16 macroblocks) — see
+   `horizontal-multimb64-golden-vector` below: real libx264-selected
+   Intra_16x16 LUMA Horizontal prediction (mode 1) across 12 of the 16
+   macroblocks, both DC-only and full-AC luma coded-block-pattern paths.
+   Fixes a real desync/wrong-pixel bug this repo shipped with (see
+   `h264.decode/blk->col-row` and `h264.transform/luma-dc-hadamard`
+   docstrings)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
             [h264.decode :as decode]))
@@ -133,6 +141,71 @@
               "luma: DC (mb0/mb1, no top neighbor) then Vertical (mb2/mb3, real top-neighbor-derived prediction)")
           (is (= [0 1 2 0] (:mb-intra-chroma-pred-modes result))
               "chroma: DC, Horizontal, Vertical, DC — all three implemented Intra_Chroma modes actually chosen by x264"))))))
+
+(deftest horizontal-multimb64-golden-vector
+  (let [bytes (rd "h264/fixtures/horizontal-multimb64.h264")]
+    (testing "horizontal-multimb64.h264 — 64x64 (4x4=16 macroblocks), REAL libx264
+     (Constrained Baseline, CAVLC) Annex B stream, generated:
+       ffmpeg -f lavfi -i \"color=size=64x64:c=black\" \\
+         -vf \"geq=lum='128+50*sin(2*PI*Y/64)':cb=128:cr=128\" \\
+         -frames:v 1 -update 1 horizontal-multimb64.png
+       ffmpeg -i horizontal-multimb64.png -pix_fmt yuv420p horizontal-multimb64.y4m
+       x264 --input-res 64x64 --fps 25 -o horizontal-multimb64.h264 --qp 30 \\
+         --keyint 1 --preset ultrafast --no-deblock --profile baseline \\
+         horizontal-multimb64.y4m
+     Luma varies smoothly by ROW only (constant along each row, `sin` of Y) —
+     deliberately, so libx264 has a genuine RD reason to pick Intra_16x16
+     LUMA HORIZONTAL prediction (mode 1, copy the left neighbor's column)
+     for most macroblocks once a left neighbor is available; chroma is flat
+     (already validated bit-exact by `chroma-multimb32-golden-vector`, not
+     the point of this fixture). `--no-deblock` sets
+     `disable_deblocking_filter_idc=1` in the slice header (a properly
+     signaled, spec-mandatory flag — decoders MUST skip deblocking when
+     it's set) so this fixture's genuine cross-block-boundary gradient
+     doesn't require the (out-of-scope, undocumented-as-implemented)
+     deblocking loop filter to match ffmpeg's own decode bit-exact.
+
+     This is the first bit-exact-validated real-encoder example of luma
+     Horizontal (mode 1) in a multi-macroblock picture (`:mb-pred-modes` is
+     `[2 1 1 1 0 1 1 1 0 1 1 1 0 1 1 1]` — DC only for MB0 (no neighbors),
+     Vertical for the leftmost MB of each subsequent row (top neighbor
+     only), Horizontal for every other MB — 12 of 16), exercising BOTH real
+     cross-macroblock CAVLC neighbor (nC) derivation for the Intra16x16
+     LUMA DC block specifically (previously only exercised for chroma —
+     see `h264.decode/decode-macroblock!`'s `dc-nc` computation) and the
+     luma DC Hadamard transform's own block-index correspondence for
+     content that varies along ONE screen axis only, distinguishing it from
+     `gradient16-ac.h264` (single-MB, no cross-MB neighbor) and
+     `chroma-multimb32.h264` (flat luma). Previously an open, tracked
+     limitation (see README \"Pixel decode\" — real x264 streams selecting
+     luma Horizontal across multiple macroblocks reproducibly desynced the
+     CAVLC bit reader a few macroblocks in); root-caused to two independent
+     bugs that had to be fixed together: (1) the Intra16x16 luma DC block's
+     cross-MB nC derivation was reading the wrong neighbor state
+     (`:dc-nnz`, the neighbor's own DC total-coeff, instead of `:ac-nnz` at
+     luma 4x4 block position [3,0]/[0,3] — see `h264.decode/decode-macroblock!`),
+     and (2) `h264.decode/blk->col-row` used an incorrect column-major
+     block-index-to-position mapping AND `h264.transform/luma-dc-hadamard`
+     was missing an input transpose analogous to `inverse-4x4`'s own
+     (documented) one — both independently re-derived and cross-checked
+     against FFmpeg's `libavcodec/h264dec.c`/`h264_mb.c` source (see those
+     two functions' docstrings for the full derivation)."
+      (let [result (decode/decode-idr-frame bytes)
+            ref (rd "h264/fixtures/horizontal-multimb64.ref.yuv")
+            luma-ref (vec (take 4096 ref))
+            cb-ref (vec (subvec (vec ref) 4096 5120))
+            cr-ref (vec (subvec (vec ref) 5120 6144))]
+        (testing "dimensions from SPS"
+          (is (= 64 (:width result)))
+          (is (= 64 (:height result))))
+        (testing "reconstructed luma plane is bit-exact vs. real ffmpeg decode (real cross-macroblock Horizontal prediction + DC-block nC derivation)"
+          (is (= luma-ref (:luma result))))
+        (testing "reconstructed Cb/Cr planes are bit-exact vs. real ffmpeg decode"
+          (is (= cb-ref (:cb result)))
+          (is (= cr-ref (:cr result))))
+        (testing "a real encoder actually selected luma Horizontal prediction across most macroblocks"
+          (is (= [2 1 1 1 0 1 1 1 0 1 1 1 0 1 1 1] (:mb-pred-modes result))
+              "luma: DC (mb0, no neighbors), then Vertical/Horizontal per real encoder RD choice — 12 of 16 macroblocks Horizontal"))))))
 
 (deftest unsupported-mb-type-throws
   (testing "mb_type 0 (I_NxN / Intra_4x4) is out of scope and throws rather than mis-decoding"

@@ -62,21 +62,56 @@
 (def zigzag scan/zigzag-4x4)
 
 (def blk->col-row
-  "H.264 4x4 luma block index (0..15, CAVLC/residual decode order) → [col
-   row] (both 0..3) within the macroblock's 4x4-block grid. This exact
-   mapping — including which pairs of blocks are grouped together — was
-   determined empirically by decoding a real x264-encoded gradient image
-   and checking the reconstructed picture against ffmpeg's own decode
-   (see `test/h264/decode_test.clj`'s AC-coded golden vector and the task
-   session notes/ADR); it is NOT independently re-derivable from casual
-   reading of the spec's figures alone, since it must match this
-   implementation's OWN `h264.transform/luma-dc-hadamard` index arithmetic
-   (itself ported 1:1 from FFmpeg's `x_offset`/`stride` trick) — changing
-   one without the other will silently break block placement."
-  {0 [0 0], 1 [0 1], 2 [1 0], 3 [1 1]
-   4 [0 2], 5 [0 3], 6 [1 2], 7 [1 3]
-   8 [2 0], 9 [2 1], 10 [3 0], 11 [3 1]
-   12 [2 2], 13 [2 3], 14 [3 2], 15 [3 3]})
+  "H.264 4x4 luma block index (0..15, CAVLC/residual decode order — the
+   spec's `luma4x4BlkIdx`, Figure 6-10) → [col row] (both 0..3) within the
+   macroblock's 4x4-block grid.
+
+   The four 4x4 blocks 0..15 group into FOUR 8x8 quadrants in raster order
+   (TL=0-3, TR=4-7, BL=8-11, BR=12-15 — GLOBAL quadrant positions [0,0]
+   [2,0] [0,2] [2,2] respectively), and WITHIN each quadrant the four 4x4
+   sub-blocks are ALSO in plain raster order (TL,TR,BL,BR — col varies
+   fastest, matching `h264.decode/chroma-blk->col-row`'s 2x2 raster
+   convention, NOT a column-major/Z-order variant).
+
+   PREVIOUSLY (through the chroma-decode/multi-MB-V/H-prediction
+   development session) this table used an INCORRECT column-major variant
+   (`{0 [0 0], 1 [0 1], 2 [1 0], ...}` — row and col swapped relative to
+   the mapping above, i.e. a transpose of the correct table) that was
+   believed \"empirically validated\" by the single-macroblock
+   `gradient16-ac.h264` fixture and the multi-macroblock
+   `chroma-multimb32.h264` fixture. Both fixtures' LUMA content is
+   direction-degenerate in a way that can't distinguish a transposed block
+   mapping from the correct one (a single-MB horizontal gradient has no
+   cross-MB neighbor to expose it; the multimb32 fixture's luma is flat).
+   The bug was only exposed by a genuinely cross-macroblock, row-varying
+   (not column-varying) multi-MB luma test — where libx264 selected
+   Intra_16x16 Horizontal prediction — via a real desync/wrong-pixel
+   investigation (see README \"Pixel decode\" and ADR history around the
+   Horizontal-prediction multi-macroblock golden vector). The correct
+   mapping was independently re-derived (and cross-checked three ways) from
+   FFmpeg's OWN source: (1) `scan8[]`'s neighbor-addressing formula
+   (`libavcodec/h264dec.h`/callers), (2) the `ref_index`/`scan8[0|4|8|12]`
+   8x8-partition assignment in `ff_h264_slice_context_init`
+   (`libavcodec/h264dec.c`), and (3) the explicit `dc_mapping[16]` table in
+   `hl_decode_mb_idct_luma` (`libavcodec/h264_mb.c`, the
+   `transform_bypass`/lossless path, which spells out DC-raster-position →
+   block-index numerically) — all three agree exactly on the mapping below.
+   `h264.transform/luma-dc-hadamard`'s own arithmetic (`x_offset`/`stride`,
+   kept as a byte-for-byte port of `ff_h264_luma_dc_dequant_idct`) already
+   produces its 16-element output correctly indexed by this SAME true
+   block numbering (verified: `out[16*k]` for k=0..15 lines up exactly with
+   `stride*R+offset` for the (loop-i, R) combination that
+   `ff_h264_luma_dc_dequant_idct`'s caller — `sl->mb + p*256` — treats as
+   block-major storage). It ALSO needs its OWN input transposed first
+   (see `h264.transform/luma-dc-hadamard`'s docstring) — the two bugs
+   compound: without the input transpose, the DC-Hadamard-derived values
+   vary along the wrong screen axis (column instead of row for row-varying
+   content) regardless of which `blk->col-row` is used; fixing only one of
+   the two still fails."
+  {0 [0 0], 1 [1 0], 2 [0 1], 3 [1 1]
+   4 [2 0], 5 [3 0], 6 [2 1], 7 [3 1]
+   8 [0 2], 9 [1 2], 10 [0 3], 11 [1 3]
+   12 [2 2], 13 [3 2], 14 [2 3], 15 [3 3]})
 
 (def col-row->blk
   (into {} (map (fn [[k v]] [v k]) blk->col-row)))
@@ -297,7 +332,32 @@
         ;; silently produce a wrong dequant scale.
         qp' (mod (+ qp mb-qp-delta 52) 52)
         qpc (quant/chroma-qp qp' chroma-qp-index-offset)
-        dc-nc (neighbor-nc (:dc-nnz left-mb) (:dc-nnz top-mb))
+        ;; §9.2.1 nC derivation for the Intra16x16 luma DC block: per
+        ;; ffmpeg's `decode_residual`/`pred_non_zero_count` (and the spec's
+        ;; §6.4.11.4 neighbouring-4x4-luma-block process), the DC block is
+        ;; positioned at 4x4 luma block index 0 for NEIGHBOR-DERIVATION
+        ;; purposes — its nC uses the SAME neighbor cells as luma AC block 0
+        ;; (left neighbor MB's block [3,0], top neighbor MB's block [0,3]),
+        ;; i.e. `:ac-nnz`, NOT a separate DC-total-coeff channel. This is
+        ;; NOT obvious from a naive reading (there being both a per-MB
+        ;; :dc-nnz already in this state map invites reusing it directly),
+        ;; but ffmpeg explicitly stores the DC block's own total_coeff into
+        ;; a dedicated cache slot that NO neighbor-derivation read ever
+        ;; consults — and when cbp_luma is 0 (DC-only, no AC), ffmpeg
+        ;; explicitly zero-fills the AC nnz cache for the WHOLE macroblock
+        ;; (`decode_luma_residual`'s `else` branch), so a neighbor MB's
+        ;; contribution to nC is 0 in that case regardless of how many
+        ;; nonzero DC coefficients that neighbor actually had. Using
+        ;; `:dc-nnz` here (the DC block's own total-coeff) instead of
+        ;; `:ac-nnz` at block [3,0]/[0,3] silently selects the WRONG
+        ;; coeff_token VLC nC-class and desyncs the CAVLC bit reader on the
+        ;; very next macroblock that has any real neighbor-derived DC nC —
+        ;; caught via a real multi-macroblock x264 stream where MB0 had
+        ;; cbp_luma=15 (dc-total-coeff=4, ac-nnz[3,0]=0) and MB1 read the
+        ;; DC block with the wrong nc (4, i.e. VLC class 2) instead of the
+        ;; correct nc (0, class 0).
+        dc-nc (neighbor-nc (when left-mb (nth (:ac-nnz left-mb) (col-row->blk [3 0])))
+                            (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [0 3]))))
         dc-decoded (decode-luma-dc! r dc-nc qp')
         dc-per-block (:dc-per-block dc-decoded)
         dc-total-coeff (:total-coeff dc-decoded)
