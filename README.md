@@ -13,12 +13,18 @@ same batch — H.264 is jointly published by ITU-T and ISO/IEC, see
 `utsushi.bitstream/split-annexb` was an unimplemented `(throw (ex-info
 "TODO..."))` stub (discovered while decomposing `utsushi` into
 per-format-spec repos; see `com-junkawasaki/root` ADR precedent
-2607072500). This repo fills that gap for real, matching the
-"entropy-coded pixels stay opaque, only framing/metadata is decoded" design
-boundary the sibling `kasane`/`utsushi` repos already establish for
-JPEG/AVIF/etc: **actual CABAC/CAVLC slice decode is out of scope** — that's
-a capability-gated native concern per `kotoba-lang/utsushi`'s own design
-(ADR-2606272200 §3).
+2607072500). This repo originally filled that gap only for framing/
+metadata (NAL splitting, SPS/PPS), matching the "entropy-coded pixels stay
+opaque" design boundary `kasane`/`utsushi` establish for JPEG/AVIF/etc
+(ADR-2606272200 §3) — actual pixel decode was explicitly out of scope.
+
+**That framing-only boundary has since been amended for a narrow "R0.5"
+pixel-decode scope** (ADR-2607122000, `com-junkawasaki/root`): this repo
+now also implements a real, non-realtime, CAVLC + intra-only H.264
+baseline pixel decoder (`h264.decode` et al., see "Pixel decode" below).
+The original framing-only boundary still holds for **CABAC**, inter
+prediction, and chroma — those remain out of scope (see below for exactly
+what is/isn't covered).
 
 ## Namespaces
 
@@ -29,6 +35,12 @@ a capability-gated native concern per `kotoba-lang/utsushi`'s own design
 | `h264.expgolomb` | decode: MSB-first bit reader + Exp-Golomb `ue(v)`/`se(v)` decode (H.264 §9.1). encode: matching bit `writer` + `write-ue!`/`write-se!`/`write-bits!`/`write-flag!`/`rbsp-trailing-bits!`/`bytes!` |
 | `h264.sps` | decode: SPS (NAL type 7) parse: profile/level + picture width/height (handles high-profile chroma/scaling-list fields correctly so the bit position stays aligned, though scaling-list *values* aren't surfaced). encode: `encode`, non-high-profile only, no frame-cropping (width/height must be multiples of 16) — see Encoding below |
 | `h264.pps` | decode: PPS (NAL type 8) parse: entropy coding mode (CAVLC/CABAC), reference index defaults, QP/deblocking/intra-pred flags. Covers the common case (`num_slice_groups_minus1 == 0` — FMO is essentially absent from real-world encoders); throws rather than silently mis-parsing if FMO is present. High-Profile-only trailing fields (`transform_8x8_mode_flag` etc., gated by `more_rbsp_data()`) aren't parsed — this reader doesn't track exact bit position precisely enough to detect that condition. encode: `encode`, covers the same field set as `parse` |
+| `h264.slice` | decode: slice header parse (`first_mb_in_slice`/`slice_type`/`pic_parameter_set_id`/`frame_num`/`idr_pic_id`/POC (type 0 or 2 only)/IDR dec_ref_pic_marking flags/`slice_qp_delta`/deblocking-control fields, read-and-discarded). `parse-header!` advances the SAME reader `h264.decode` continues using for macroblock data (unlike `sps`/`pps`'s private-reader `parse`) |
+| `h264.quant` | dequantization: the `normAdjust4x4` V-table (§8.5.9) + per-position `ac-qmul`/single-scalar `dc-qmul`. Implements `codec-primitives.quant/QuantScale`. Baseline scope only — no custom scaling lists (flat weight 16 everywhere) |
+| `h264.transform` | the integer 4x4 inverse transform (`inverse-4x4`, §8.5.10) + the Intra16x16 luma DC Hadamard transform (`luma-dc-hadamard`). Implements `codec-primitives.transform/BlockTransform` (`forward`/encode throws — decode-only). Arithmetic ported 1:1 from FFmpeg's reference decoder for bit-exactness, including an internal coefficient-array transpose whose necessity was discovered empirically (see "Pixel decode" below) |
+| `h264.cavlc` | CAVLC residual entropy decode (§9.2): `coeff_token`/`total_zeros`/`run_before` VLC tables (luma only — no chroma DC/AC tables) + `residual-block!` (coeff_token → trailing-ones signs → level_prefix/suffix → total_zeros → run_before → position reconstruction) |
+| `h264.intra-pred` | Intra_16x16 prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws |
+| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16 prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma plane. See "Pixel decode" below for exact scope |
 
 ## Validation
 
@@ -102,6 +114,96 @@ this repo's own `parse` functions (`sps_test.clj`/`pps_test.clj`/
 independent reference decoder (e.g. ffprobe) cross-check for the encode
 path the way `sps-from-real-encoder` has for decode, since the output
 here is a synthetic parameter-set NAL, not a decodable frame.
+
+## Pixel decode (Wave 3, ADR-2607122000 Phase 1 / "R0.5")
+
+`h264.decode/decode-idr-frame` decodes a real H.264 Annex B elementary
+stream to a raw luma pixel plane — the first time this ecosystem can
+actually reconstruct pixels from a real encoder's output rather than only
+parse framing/metadata. This is explicitly a **non-realtime, correctness-
+first reference decoder** (the "R0.5" tier of ADR-2607122000 — it is a
+golden model for a future capability-gated *native* realtime decoder
+(R1), not a claim that pure cljc decodes video at framerate).
+
+**What's implemented:**
+- Baseline profile, CAVLC (no CABAC)
+- A single IDR I-slice covering the whole picture (no multi-slice, no
+  multiple pictures/GOP, no P/B slices, no reference-picture buffering)
+- `mb_type` **Intra_16x16 only** (1..24) — `I_NxN`/Intra_4x4/Intra_8x8
+  (`mb_type` 0) and `I_PCM` (`mb_type` 25) throw a clear error rather than
+  being silently mis-decoded
+- Both `CodedBlockPatternLuma` values I16x16 macroblocks can have: 0 (DC-
+  only, no AC residual) and 15 (full AC residual for all four luma 8x8
+  groups) — both real CAVLC paths are exercised
+- Intra_16x16 prediction modes 0 (Vertical), 1 (Horizontal), 2 (DC) —
+  mode 3 (Plane) throws
+- Multi-macroblock pictures, with real cross-macroblock CAVLC neighbor
+  (`nC`) derivation and cross-macroblock Vertical/Horizontal prediction
+  using actual reconstructed neighbor pixels (the code path is generic,
+  not hardcoded to one macroblock)
+- Luma only. If a macroblock's derived `CodedBlockPatternChroma` is
+  nonzero (the bitstream actually carries chroma residual bits), decode
+  throws rather than silently desyncing the bit reader — there's no
+  chroma CAVLC table in `h264.cavlc` to consume those bits correctly
+
+**What's explicitly NOT implemented** (out of scope, not silently wrong):
+CABAC, P/B slices and all inter prediction/motion compensation, multiple
+reference frames, chroma (U/V) planes, the deblocking loop filter,
+`I_NxN`/`I_PCM` macroblock types, Plane intra prediction, frame cropping
+(picture width/height must be exact multiples of 16), and multi-picture
+streams (only the first IDR slice is decoded).
+
+**Golden-vector validation is real but narrow — read this before trusting
+a number beyond it.** `test/h264/decode_test.clj` validates against TWO
+real `ffmpeg 8.1.1`/`x264 core 165` — encoded Annex B streams, compared
+bit-exact (no tolerance) against the SAME file decoded by a real `ffmpeg`
+(not the pre-encode source image, since lossy encoding changes pixel
+values):
+
+1. **`flat16-dc-only.h264`** — a single flat 16x16 macroblock,
+   `CodedBlockPatternLuma=0`, DC prediction mode. Exercises: SPS/PPS/
+   slice-header parsing, `mb_type`→Intra_16x16 mapping, the luma DC
+   Hadamard transform + dequant, DC prediction with unavailable
+   neighbors (defaults to 128 per spec).
+2. **`gradient16-ac.h264`** — a single 16x16 macroblock with a real
+   horizontal luma gradient, forced (`x264 --partitions none`) to
+   Intra_16x16 at a QP where `CodedBlockPatternLuma=15`. Exercises: real
+   CAVLC `coeff_token`/level/`total_zeros`/`run_before` decode with
+   nonzero coefficients, within-macroblock CAVLC neighbor (`nC`)
+   derivation across the 16 luma 4x4 sub-blocks, per-position AC
+   dequantization, and the full 4x4 inverse transform combined with the
+   DC term.
+
+Both fixtures are **single-macroblock pictures**. **Multi-macroblock
+pictures and Vertical/Horizontal Intra_16x16 prediction are implemented
+but NOT exercised by either golden vector** (a real encoder never selects
+Vertical/Horizontal for an unavailable neighbor, so a single-macroblock
+picture can only ever use DC mode — a genuinely bit-exact-validated
+multi-macroblock-with-V/H-mode fixture would need a follow-up encoding
+experiment this repo hasn't done yet). Likewise the deblocking filter is
+not implemented at all; this only happens not to matter for these two
+fixtures because both reconstruct to (locally) constant regions with zero
+gradient at block boundaries, where deblocking is a mathematical no-op —
+it has NOT been shown to be safe to skip in general.
+
+**Two nonobvious implementation details, called out because a plausible-
+looking alternative silently produces wrong (but not obviously wrong —
+i.e. right-shaped, wrong-valued) output:**
+- `h264.transform/inverse-4x4`'s coefficient input needs an internal
+  transpose relative to the "obvious" row-major reading of FFmpeg's
+  `ff_h264_idct_add` C source — this was found empirically (decoding
+  `gradient16-ac.h264` first produced a *transposed* picture) rather than
+  by static code reading, and is called out in the namespace docstring so
+  a future port doesn't "simplify it away."
+- `>>6`/`>>8` rounding in `h264.decode`/`h264.transform` is implemented
+  with `bit-shift-right` (an arithmetic/floor shift), not `quot` — for
+  the negative coefficient values CAVLC can produce, `quot` (truncating
+  toward zero) gives a different result than C's `>>` whenever the value
+  isn't an exact multiple of 64. This was caught during implementation,
+  not by the golden-vector tests (both fixtures' specific coefficient
+  values happen not to expose most instances of this — see
+  `h264.transform-test/inverse-4x4-negative-dc-rounds-toward-negative-infinity`
+  for an isolated regression test of just this).
 
 ## Test
 

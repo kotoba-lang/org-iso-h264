@@ -49,12 +49,14 @@
                     (skip-scaling-list! r (if (< i 6) 16 64))))))
             cfi)
           1)                                                  ; default 4:2:0 when not signaled
-        _log2-max-frame-num (eg/ue! r)
+        log2-max-frame-num-minus4 (eg/ue! r)
         poc-type (eg/ue! r)
-        _ (case poc-type
+        log2-max-poc-lsb-minus4
+        (case poc-type
             0 (eg/ue! r)                                      ; log2_max_pic_order_cnt_lsb_minus4
             1 (do (eg/flag! r) (eg/se! r) (eg/se! r)
-                  (let [n (eg/ue! r)] (dotimes [_ n] (eg/se! r))))
+                  (let [n (eg/ue! r)] (dotimes [_ n] (eg/se! r)))
+                  nil)
             nil)
         _max-num-ref-frames (eg/ue! r)
         _gaps-allowed (eg/flag! r)
@@ -79,7 +81,10 @@
      :chroma-format-idc chroma-format-idc
      :frame-mbs-only? frame-mbs-only?
      :width  width
-     :height height}))
+     :height height
+     :log2-max-frame-num-minus4 log2-max-frame-num-minus4
+     :pic-order-cnt-type poc-type
+     :log2-max-pic-order-cnt-lsb-minus4 log2-max-poc-lsb-minus4}))
 
 ;; --- encode side (Wave 2 addition, kotoba-lang/root ADR-2607121400) ---
 
