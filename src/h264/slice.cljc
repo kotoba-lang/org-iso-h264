@@ -25,7 +25,10 @@
    `nal-ref-idc` is nonzero, matching spec's `if (nal_ref_idc != 0)` gate),
    slice_qp_delta, and the deblocking_filter_control fields (read-and-
    discarded — SPS/PPS-controlled deblocking is out of scope for this
-   decoder's R0.5 reference-decode phase; see README).
+   decoder's R0.5 reference-decode phase; see README). ALSO (ADR-2607122000
+   P-slice CABAC increment): `cabac_init_idc` (P-slice only, present only
+   when the PPS declares `entropy_coding_mode_flag`==1 — selects one of 3
+   P-slice-only CABAC context-init columns, see `h264.cabac/init-contexts`).
 
    `parse-header!` takes an already-positioned `h264.expgolomb` reader
    (created by the caller over the slice RBSP, NAL header byte included at
@@ -63,7 +66,7 @@
              log2-max-pic-order-cnt-lsb-minus4]}
    {:keys [pic-init-qp deblocking-filter-control-present?
            num-ref-idx-l0-default-active weighted-pred?
-           redundant-pic-cnt-present?]}
+           redundant-pic-cnt-present? entropy-coding-mode]}
    nal-type nal-ref-idc]
   (let [idr? (= nal-type 5)
         first-mb-in-slice (eg/ue! r)
@@ -102,6 +105,27 @@
                   (eg/flag! r))   ; long_term_reference_flag
               (when (= 1 (eg/flag! r))                 ; adaptive_ref_pic_marking_mode_flag
                 (throw (ex-info "h264.slice: adaptive reference marking (MMCO) not supported" {})))))
+        ;; --- cabac_init_idc (§7.3.3, ADR-2607122000 P-slice CABAC increment)
+        ;;     — present ONLY when entropy_coding_mode_flag==1 AND slice_type
+        ;;     is P/SP/B (never for I/SI, where it isn't even signaled — CABAC
+        ;;     context init always uses the SINGLE I-slice column regardless,
+        ;;     see `h264.cabac/init-contexts`). `ue(v)` (NOT a fixed 2-bit
+        ;;     field — verified against FFmpeg's own `h264_slice.c`
+        ;;     `get_ue_golomb_31`/`cabac_init_idc` after an initial WRONG
+        ;;     `u(2)` read produced a real, immediately-caught desync: a real
+        ;;     x264 CABAC P-slice's next 2 raw bits decoded to 3, an
+        ;;     impossible `cabac_init_idc` value, before this fix), values
+        ;;     0/1/2 select one of 3 P/B-only (m,n) context-init columns
+        ;;     (`context-init-p0/p1/p2`) — a DIFFERENT mechanism from
+        ;;     I-slice's fixed column, not merely an unused field for this
+        ;;     repo's P-slice scope. Throws on a decoded value > 2 (matches
+        ;;     FFmpeg's own overflow check) rather than silently misindexing.
+        cabac-init-idc
+        (when (and (= slice-class :p) (= entropy-coding-mode :cabac))
+          (let [idc (eg/ue! r)]
+            (when (> idc 2)
+              (throw (ex-info "h264.slice: cabac_init_idc out of range (0..2)" {:cabac-init-idc idc})))
+            idc))
         slice-qp-delta (eg/se! r)
         _ (when deblocking-filter-control-present?
             (let [idc (eg/ue! r)]
@@ -114,7 +138,8 @@
      :frame-num frame-num
      :idr-pic-id idr-pic-id
      :slice-qp-delta slice-qp-delta
-     :slice-qp (+ pic-init-qp slice-qp-delta)}))
+     :slice-qp (+ pic-init-qp slice-qp-delta)
+     :cabac-init-idc cabac-init-idc}))
 
 ;; --- encode side (ADR-2607122000 Migration step 8) ---
 
