@@ -38,9 +38,11 @@ what is/isn't covered).
 | `h264.slice` | decode: slice header parse (`first_mb_in_slice`/`slice_type`/`pic_parameter_set_id`/`frame_num`/`idr_pic_id`/POC (type 0 or 2 only)/IDR dec_ref_pic_marking flags/`slice_qp_delta`/deblocking-control fields, read-and-discarded). `parse-header!` advances the SAME reader `h264.decode` continues using for macroblock data (unlike `sps`/`pps`'s private-reader `parse`) |
 | `h264.quant` | dequantization: the `normAdjust4x4` V-table (§8.5.9) + per-position `ac-qmul`/single-scalar `dc-qmul`. Implements `codec-primitives.quant/QuantScale`. Baseline scope only — no custom scaling lists (flat weight 16 everywhere) |
 | `h264.transform` | the integer 4x4 inverse transform (`inverse-4x4`, §8.5.10) + the Intra16x16 luma DC Hadamard transform (`luma-dc-hadamard`). Implements `codec-primitives.transform/BlockTransform` (`forward`/encode throws — decode-only). Arithmetic ported 1:1 from FFmpeg's reference decoder for bit-exactness, including an internal coefficient-array transpose whose necessity was discovered empirically (see "Pixel decode" below) |
-| `h264.cavlc` | CAVLC residual entropy decode (§9.2): `coeff_token`/`total_zeros`/`run_before` VLC tables (luma only — no chroma DC/AC tables) + `residual-block!` (coeff_token → trailing-ones signs → level_prefix/suffix → total_zeros → run_before → position reconstruction) |
-| `h264.intra-pred` | Intra_16x16 prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws |
-| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16 prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma plane. See "Pixel decode" below for exact scope |
+| `h264.cavlc` | CAVLC residual entropy decode (§9.2): `coeff_token`/`total_zeros`/`run_before` VLC tables (luma AND the ChromaArrayType 1 chroma-DC `nC==-1` special case) + `residual-block!` (coeff_token → trailing-ones signs → level_prefix/suffix → total_zeros → run_before → position reconstruction) |
+| `h264.intra-pred` | Intra_16x16 luma prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws. Intra_Chroma prediction (§8.3.4, 4:2:0 8x8 blocks, `predict-chroma-8x8`): ALL FOUR modes (DC/Horizontal/Vertical/Plane) — see "Chroma decode" below for why Plane is implemented here but not for luma |
+| `h264.quant` | (also) `chroma-qp`: QPc derivation from QPy + PPS `chroma_qp_index_offset` (§8.5.8 Table 8-15) |
+| `h264.transform` | (also) `chroma-dc-hadamard`: the 2x2 chroma-DC Hadamard transform (§8.5.8/§8.5.11) |
+| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. See "Pixel decode" below for exact scope |
 
 ## Validation
 
@@ -135,36 +137,51 @@ golden model for a future capability-gated *native* realtime decoder
 - Both `CodedBlockPatternLuma` values I16x16 macroblocks can have: 0 (DC-
   only, no AC residual) and 15 (full AC residual for all four luma 8x8
   groups) — both real CAVLC paths are exercised
-- Intra_16x16 prediction modes 0 (Vertical), 1 (Horizontal), 2 (DC) —
+- Intra_16x16 luma prediction modes 0 (Vertical), 1 (Horizontal), 2 (DC) —
   mode 3 (Plane) throws
 - Multi-macroblock pictures, with real cross-macroblock CAVLC neighbor
   (`nC`) derivation and cross-macroblock Vertical/Horizontal prediction
   using actual reconstructed neighbor pixels (the code path is generic,
-  not hardcoded to one macroblock)
-- Luma only. If a macroblock's derived `CodedBlockPatternChroma` is
-  nonzero (the bitstream actually carries chroma residual bits), decode
-  throws rather than silently desyncing the bit reader — there's no
-  chroma CAVLC table in `h264.cavlc` to consume those bits correctly
+  not hardcoded to one macroblock) — see the multi-macroblock golden
+  vector below for the extent this is actually validated
+- **Chroma (Cb/Cr), ChromaArrayType 1 (4:2:0) only** (Wave 4 addition,
+  chroma-decode follow-up to Phase 1): chroma DC (the `nC==-1` special
+  CAVLC table + 2x2 Hadamard transform) and chroma AC (regular
+  neighbor-derived 4x4 blocks, reusing the luma AC CAVLC/dequant/IDCT
+  path with QPc — `h264.quant/chroma-qp` — instead of QPy), for both
+  `CodedBlockPatternChroma` values that carry residual (1 = DC only, 2 =
+  DC+AC) as well as 0 (prediction only, no residual). All FOUR
+  Intra_Chroma prediction modes (DC/Horizontal/Vertical/Plane) are
+  implemented — unlike luma, where Plane is out of scope, chroma Plane
+  IS implemented because a real x264 encoder was observed selecting it
+  even for near-flat chroma content whenever both neighbors are
+  available (an RD tie-break, not a genuine gradient) — leaving it
+  unimplemented would make chroma decode fail on ordinary real streams,
+  not just contrived ones. `decode-idr-frame` returns `:cb`/`:cr` planes
+  (each `(width/2)*(height/2)`, flat row-major) alongside `:luma`. Any
+  `chroma_format_idc` other than 1 throws.
 
 **What's explicitly NOT implemented** (out of scope, not silently wrong):
 CABAC, P/B slices and all inter prediction/motion compensation, multiple
-reference frames, chroma (U/V) planes, the deblocking loop filter,
-`I_NxN`/`I_PCM` macroblock types, Plane intra prediction, frame cropping
-(picture width/height must be exact multiples of 16), and multi-picture
-streams (only the first IDR slice is decoded).
+reference frames, ChromaArrayType 0/2/3 (monochrome/4:2:2/4:4:4), the
+deblocking loop filter, `I_NxN`/`I_PCM` macroblock types, Plane *luma*
+intra prediction (Plane *chroma* IS implemented, see above), frame
+cropping (picture width/height must be exact multiples of 16), and
+multi-picture streams (only the first IDR slice is decoded).
 
 **Golden-vector validation is real but narrow — read this before trusting
-a number beyond it.** `test/h264/decode_test.clj` validates against TWO
-real `ffmpeg 8.1.1`/`x264 core 165` — encoded Annex B streams, compared
+a number beyond it.** `test/h264/decode_test.clj` validates against real
+`ffmpeg 8.1.1`/`x264 core 165` — encoded Annex B streams, compared
 bit-exact (no tolerance) against the SAME file decoded by a real `ffmpeg`
 (not the pre-encode source image, since lossy encoding changes pixel
-values):
+values) — **luma AND chroma (Cb/Cr) both**, for every fixture below:
 
 1. **`flat16-dc-only.h264`** — a single flat 16x16 macroblock,
    `CodedBlockPatternLuma=0`, DC prediction mode. Exercises: SPS/PPS/
    slice-header parsing, `mb_type`→Intra_16x16 mapping, the luma DC
    Hadamard transform + dequant, DC prediction with unavailable
-   neighbors (defaults to 128 per spec).
+   neighbors (defaults to 128 per spec). Chroma here is DC-only
+   (`CodedBlockPatternChroma` 0 or 1) — no chroma AC.
 2. **`gradient16-ac.h264`** — a single 16x16 macroblock with a real
    horizontal luma gradient, forced (`x264 --partitions none`) to
    Intra_16x16 at a QP where `CodedBlockPatternLuma=15`. Exercises: real
@@ -173,20 +190,46 @@ values):
    derivation across the 16 luma 4x4 sub-blocks, per-position AC
    dequantization, and the full 4x4 inverse transform combined with the
    DC term.
+3. **`chroma-multimb32.h264`** — 32x32 (2x2 macroblocks), flat
+   (uniform-gray) luma but a real 2-D oscillating (`sin`/`cos`) Cb/Cr
+   pattern, so libx264 never has an RD reason to pick anything but
+   Intra_16x16 for luma (`mb I  I16..4: 100.0%  0.0%  0.0%`) while
+   Cb/Cr get genuine per-macroblock DC **and AC** residual across all 4
+   macroblocks (`coded y,uvDC,uvAC intra: 0.0% 100.0% 100.0%`). This is
+   the multi-macroblock validation: real cross-macroblock CAVLC neighbor
+   (`nC`) derivation for chroma AC (proven across 4 separate macroblocks,
+   not just within one), and 3 of the 4 Intra_Chroma modes actually
+   selected by a real encoder (DC/Horizontal/Vertical — `:mb-intra-chroma-pred-modes`
+   is `[0 1 2 0]`) plus real cross-macroblock luma Vertical prediction
+   (`:mb-pred-modes` is `[2 2 0 0]` — DC for the top row with no top
+   neighbor, Vertical for the bottom row using actual reconstructed
+   neighbor pixels).
 
-Both fixtures are **single-macroblock pictures**. **Multi-macroblock
-pictures and Vertical/Horizontal Intra_16x16 prediction are implemented
-but NOT exercised by either golden vector** (a real encoder never selects
-Vertical/Horizontal for an unavailable neighbor, so a single-macroblock
-picture can only ever use DC mode — a genuinely bit-exact-validated
-multi-macroblock-with-V/H-mode fixture would need a follow-up encoding
-experiment this repo hasn't done yet). Likewise the deblocking filter is
-not implemented at all; this only happens not to matter for these two
-fixtures because both reconstruct to (locally) constant regions with zero
+Fixtures 1/2 are **single-macroblock pictures** (mode 0/1 Intra_16x16
+luma prediction is implemented but not exercised by either — a real
+encoder never selects Vertical/Horizontal for an unavailable neighbor).
+Fixture 3 is multi-macroblock and validates real chroma cross-macroblock
+decode plus luma DC/Vertical, **but does not include a bit-exact-validated
+real-encoder example of luma Horizontal (mode 1) in a multi-macroblock
+picture** — every real x264-encoded multi-macroblock stream tried during
+this development session that had libx264 actually select luma Horizontal
+also hit a still-unresolved decode desync a few macroblocks later
+(reproduced identically by an independent from-scratch Python CAVLC
+walker, so it isn't a Clojure-specific implementation bug in the parts
+already exercised — but the root cause wasn't found in the time available
+and is a genuine, open, tracked limitation, not hand-waved away). Luma
+Horizontal prediction ITSELF (`h264.intra-pred/predict-16x16` mode 1) is
+the identical code path as luma Vertical (already bit-exact-validated
+above) and is separately unit-tested (`intra_pred_test.clj`); the *chroma*
+Horizontal mode (structurally the same "copy left column" logic,
+`predict-chroma-8x8` mode 1) IS bit-exact-validated in a real
+multi-macroblock stream (fixture 3, MB1). Likewise the deblocking filter
+is not implemented at all; this only happens not to matter for these
+fixtures because they reconstruct to (locally) constant regions with zero
 gradient at block boundaries, where deblocking is a mathematical no-op —
 it has NOT been shown to be safe to skip in general.
 
-**Two nonobvious implementation details, called out because a plausible-
+**Nonobvious implementation details, called out because a plausible-
 looking alternative silently produces wrong (but not obviously wrong —
 i.e. right-shaped, wrong-valued) output:**
 - `h264.transform/inverse-4x4`'s coefficient input needs an internal
@@ -204,6 +247,25 @@ i.e. right-shaped, wrong-valued) output:**
   values happen not to expose most instances of this — see
   `h264.transform-test/inverse-4x4-negative-dc-rounds-toward-negative-infinity`
   for an isolated regression test of just this).
+- **Chroma sub-block bitstream/placement order is plain RASTER order
+  (0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)** —
+  `h264.decode/chroma-blk->col-row` — which is a **different**
+  convention than luma's own 4x4-sub-block order
+  (`h264.decode/blk->col-row`, a column-major/Z-order convention). It's
+  tempting to assume chroma reuses the exact same building block as luma
+  (ffmpeg's internal index arithmetic uses the same `16 + 16*chroma_idx
+  + i4x4` numbering for both), but that assumption is WRONG and was
+  caught empirically: a real multi-macroblock color-gradient chroma
+  golden vector decoded to a right-shaped, wrong-valued picture
+  (top-right/bottom-left quadrant AC coefficients transposed) until the
+  raster convention was substituted for chroma specifically.
+- **Chroma DC/AC residual bitstream order is Cb-DC, Cr-DC, Cb-AC (×4),
+  Cr-AC (×4)** — NOT Cb(DC then AC) followed by Cr(DC then AC). Decoding
+  one component fully before starting the other silently desyncs the bit
+  reader on the first macroblock that has real chroma AC
+  (`CodedBlockPatternChroma == 2`) — DC-only fixtures don't exercise this
+  order at all, so this only surfaces with real multi-component AC
+  content. See `h264.decode/decode-chroma-ac-blocks!`'s docstring.
 
 ## Test
 
