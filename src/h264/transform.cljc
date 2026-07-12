@@ -330,6 +330,64 @@
                                  (range 16)))]
            (round-half-up-frac (* 16 s) qmul)))))
 
+(def chroma-dc-hadamard-fwd-matrix
+  "4x4 integer matrix `H4` such that the EXISTING, tested `chroma-dc-hadamard`
+   (called with `qmul=128`, which makes its internal `sc` scaling the
+   identity — `(v*128)>>7 = v` exactly, no truncation, the chroma-DC analogue
+   of `dc-hadamard-fwd-matrix`'s `qmul=256` for luma) computes
+   `dc-quad[i] = sum_k (H4[i][k] * dc-raster[k])` for every unit-impulse
+   `dc-raster`. Empirically PROBED (not hand-derived), by unit-impulse-testing
+   `chroma-dc-hadamard` directly (see ADR-2607122000 chroma-encode session
+   notes): impulse at position 0 -> `[1 1 1 1]`, position 1 -> `[1 -1 1 -1]`,
+   position 2 -> `[1 1 -1 -1]`, position 3 -> `[1 -1 -1 1]` — i.e. `H4` is
+   exactly the 4x4 Sylvester Hadamard matrix, and (since `chroma-dc-hadamard`
+   applies the SAME matrix on both the row and column pass — see its own
+   `e`/`a'`/`b'`/`c'` derivation) each probed column equals the matching row,
+   so `H4` is symmetric. Self-consistency verified programmatically:
+   `H4 * H4^T = 4 * I` exactly (checked in `transform_test.clj`, the chroma
+   analogue of `dc-hadamard-fwd-matrix`'s own `16*I` check), proving `H4` is
+   invertible with `H4^-1 = H4^T/4 = H4/4` (symmetric). `forward-chroma-dc-hadamard`
+   below uses this exact inverse relationship, not a separately-derived
+   formula."
+  [[1 1 1 1]
+   [1 -1 1 -1]
+   [1 1 -1 -1]
+   [1 -1 -1 1]])
+
+(defn forward-chroma-dc-hadamard
+  "Encode-side exact dual of `chroma-dc-hadamard`. `target-dc-quad` is 4
+   values indexed b=0..3 (SAME raster indexing `chroma-dc-hadamard` returns,
+   idx=row*2+col — i.e. index b is the desired transform-domain DC
+   coefficient of the 4x4 chroma quadrant at that raster position, typically
+   just the sum of that quadrant's pixel-domain residual samples — see
+   `h264.encode`). `qmul` is this component's `h264.quant/dc-qmul` applied to
+   QPc (`h264.quant/chroma-qp`).
+
+   Returns the 4 raw (quantized, CAVLC-ready) integer DC levels in RASTER
+   order (idx=row*2+col — NO zigzag scan for chroma DC, matching
+   `chroma-dc-hadamard`'s own `dc-raster` input convention and
+   `h264.decode/decode-chroma-dc!`'s docstring on the identity scan) such
+   that calling the real, tested `chroma-dc-hadamard` on these levels
+   reproduces `target-dc-quad` up to integer rounding.
+
+   Derivation (mirrors `forward-luma-dc-hadamard`'s own derivation exactly,
+   just with the chroma-DC transform's own scale constants): decode computes
+   `out = sc(H4 * raw)` where `sc(v) = (v*qmul)>>7` (NO `+64` rounding bias,
+   unlike luma's `+128` — see `chroma-dc-hadamard`'s docstring), i.e.
+   `out ~= qmul*(H4*raw)/128`. Inverting: `raw ~= H4^-1 * out*128/qmul =
+   (H4/4) * out * (128/qmul) = H4*out*(32/qmul)` — so
+   `raw[p] = round(32 * (H4*target)[p] / qmul)`, using
+   `chroma-dc-hadamard-fwd-matrix` (symmetric, so `H4*target` and
+   `H4^T*target` are the same computation) via exact integer rounding
+   (`round-half-up-frac`, the same portable ties-away-from-negative-infinity
+   rounding `forward-luma-dc-hadamard` uses — no `Math/` interop)."
+  [target-dc-quad qmul]
+  (vec (for [p (range 4)]
+         (let [s (reduce + (map (fn [k] (* (get-in chroma-dc-hadamard-fwd-matrix [p k])
+                                            (nth target-dc-quad k)))
+                                 (range 4)))]
+           (round-half-up-frac (* 32 s) qmul)))))
+
 (defrecord H264BlockTransform []
   cp-transform/BlockTransform
   (forward [_ block] (forward-4x4 block))
