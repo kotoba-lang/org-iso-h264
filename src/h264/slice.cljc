@@ -1,13 +1,28 @@
 (ns h264.slice
   "H.264 slice header parsing (ITU-T H.264 / ISO/IEC 14496-10 §7.3.3
-   slice_header). Scope: exactly what's needed to decode a single IDR
-   I-slice (this repo's decode scope, see `h264.decode`) — first_mb_in_slice,
-   slice_type, pic_parameter_set_id, frame_num, idr_pic_id, POC fields
-   (only for pic_order_cnt_type 0, the common case; type 1/2 pictures throw
-   — type 2 in particular derives POC directly from frame_num and needs no
-   extra bits here, so it's actually already fully handled by NOT reading
-   anything extra, but is called out explicitly since it's what this repo's
-   own golden-vector fixtures use), dec_ref_pic_marking's two IDR flags,
+   slice_header). Scope: I-slices (this repo's original decode scope, see
+   `h264.decode`) AND P-slices (ADR-2607122000 Migration step 7's first
+   increment — single reference frame, no reference-list reordering, no
+   weighted prediction, no adaptive/MMCO reference marking) —
+   first_mb_in_slice, slice_type, pic_parameter_set_id, frame_num,
+   idr_pic_id, POC fields (only for pic_order_cnt_type 0, the common case;
+   type 1 throws — type 2 in particular derives POC directly from frame_num
+   and needs no extra bits here, so it's actually already fully handled by
+   NOT reading anything extra, but is called out explicitly since it's what
+   this repo's own golden-vector fixtures use), redundant_pic_cnt (read-
+   and-discarded when the PPS declares it present — needed for P-slices too,
+   since it precedes the P-specific fields below),
+   num_ref_idx_active_override_flag / num_ref_idx_l0_active_minus1 (P-slice
+   only — this repo requires the ACTIVE count to resolve to exactly 1,
+   i.e. a single reference frame, throwing otherwise),
+   ref_pic_list_modification_flag_l0 (P-slice only — throws if set, since
+   reference-list reordering implies >1 candidate reference, out of scope),
+   pred_weight_table absence check (throws if PPS `weighted_pred?` is set,
+   since explicit weighted prediction is out of scope), dec_ref_pic_marking
+   (IDR's two flags for IDR pictures per the ORIGINAL scope, OR — new —
+   non-IDR's adaptive_ref_pic_marking_mode_flag, throwing if set since MMCO
+   reference-list editing is out of scope; only read at all when
+   `nal-ref-idc` is nonzero, matching spec's `if (nal_ref_idc != 0)` gate),
    slice_qp_delta, and the deblocking_filter_control fields (read-and-
    discarded — SPS/PPS-controlled deblocking is out of scope for this
    decoder's R0.5 reference-decode phase; see README).
@@ -25,22 +40,35 @@
    media/graphics standards-substrate split (com-junkawasaki/root)."
   (:require [h264.expgolomb :as eg]))
 
+(defn slice-type-class
+  "Raw `slice_type` (0..9, §7.4.3) → a keyword per Table 7-6's mod-5
+   collapse (`slice_type` and `slice_type + 5` — \"all slices in the
+   picture have this type\" — mean the same thing): :p (0/5) :b (1/6)
+   :i (2/7) :sp (3/8) :si (4/9)."
+  [slice-type]
+  (case (mod slice-type 5)
+    0 :p 1 :b 2 :i 3 :sp 4 :si))
+
 (defn parse-header!
   "Advance `r` (an `h264.expgolomb` reader already past the 1-byte NAL
    header) past the slice header, given the SPS map (`h264.sps/parse`
    result) and PPS map (`h264.pps/parse` result) it references. `nal-type`
-   is the containing NAL's `nal-unit-type` (5 = IDR slice — this repo only
-   decodes IDR I-slices, see `h264.decode`).
+   is the containing NAL's `nal-unit-type` (5 = IDR slice); `nal-ref-idc`
+   is the containing NAL's `nal_ref_idc` (gates whether `dec_ref_pic_marking`
+   is present at all, per spec — see namespace docstring).
 
-   Returns {:first-mb-in-slice :slice-type :pic-parameter-set-id
-   :frame-num :idr-pic-id :slice-qp-delta}."
+   Returns {:first-mb-in-slice :slice-type :slice-type-class
+   :pic-parameter-set-id :frame-num :idr-pic-id :slice-qp-delta :slice-qp}."
   [r {:keys [log2-max-frame-num-minus4 pic-order-cnt-type
              log2-max-pic-order-cnt-lsb-minus4]}
-   {:keys [pic-init-qp deblocking-filter-control-present?]}
-   nal-type]
+   {:keys [pic-init-qp deblocking-filter-control-present?
+           num-ref-idx-l0-default-active weighted-pred?
+           redundant-pic-cnt-present?]}
+   nal-type nal-ref-idc]
   (let [idr? (= nal-type 5)
         first-mb-in-slice (eg/ue! r)
         slice-type (eg/ue! r)
+        slice-class (slice-type-class slice-type)
         pic-parameter-set-id (eg/ue! r)
         frame-num (eg/bits! r (+ log2-max-frame-num-minus4 4))
         idr-pic-id (when idr? (eg/ue! r))
@@ -50,9 +78,30 @@
             2 nil ; POC derived directly from frame_num — no extra bits
             (throw (ex-info "h264.slice: only pic_order_cnt_type 0/2 supported"
                              {:pic-order-cnt-type pic-order-cnt-type})))
-        _ (when idr?
-            (eg/flag! r)   ; no_output_of_prior_pics_flag
-            (eg/flag! r))  ; long_term_reference_flag
+        _ (when redundant-pic-cnt-present?
+            (eg/ue! r))
+        ;; --- P-slice-only fields (§7.3.3), in spec syntax order ---
+        num-ref-idx-l0-active
+        (when (= slice-class :p)
+          (if (= 1 (eg/flag! r))                      ; num_ref_idx_active_override_flag
+            (inc (eg/ue! r))                           ; num_ref_idx_l0_active_minus1
+            num-ref-idx-l0-default-active))
+        _ (when (and (= slice-class :p) (not= 1 num-ref-idx-l0-active))
+            (throw (ex-info "h264.slice: only a single active L0 reference (num_ref_idx_l0_active == 1) is supported"
+                             {:num-ref-idx-l0-active num-ref-idx-l0-active})))
+        _ (when (= slice-class :p)
+            (when (= 1 (eg/flag! r))                   ; ref_pic_list_modification_flag_l0
+              (throw (ex-info "h264.slice: ref_pic_list_modification (reference-list reordering) not supported"
+                               {}))))
+        _ (when (and (= slice-class :p) weighted-pred?)
+            (throw (ex-info "h264.slice: weighted prediction (pred_weight_table) not supported" {})))
+        ;; --- dec_ref_pic_marking(), only present when nal_ref_idc != 0 ---
+        _ (when (not (zero? nal-ref-idc))
+            (if idr?
+              (do (eg/flag! r)    ; no_output_of_prior_pics_flag
+                  (eg/flag! r))   ; long_term_reference_flag
+              (when (= 1 (eg/flag! r))                 ; adaptive_ref_pic_marking_mode_flag
+                (throw (ex-info "h264.slice: adaptive reference marking (MMCO) not supported" {})))))
         slice-qp-delta (eg/se! r)
         _ (when deblocking-filter-control-present?
             (let [idc (eg/ue! r)]
@@ -60,6 +109,7 @@
                 (eg/se! r) (eg/se! r))))]
     {:first-mb-in-slice first-mb-in-slice
      :slice-type slice-type
+     :slice-type-class slice-class
      :pic-parameter-set-id pic-parameter-set-id
      :frame-num frame-num
      :idr-pic-id idr-pic-id

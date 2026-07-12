@@ -18,7 +18,7 @@
           bytes (eg/bytes! w)
           r (eg/reader bytes)
           _ (eg/bits! r 8) ; consume the NAL header byte
-          header (slice/parse-header! r sps pps 5)]
+          header (slice/parse-header! r sps pps 5 3)]
       (is (= 0 (:first-mb-in-slice header)))
       (is (= 7 (:slice-type header)))
       (is (= 0 (:pic-parameter-set-id header)))
@@ -35,7 +35,7 @@
           bytes (eg/bytes! w)
           r (eg/reader bytes)
           _ (eg/bits! r 8)
-          header (slice/parse-header! r sps pps 5)]
+          header (slice/parse-header! r sps pps 5 3)]
       (is (= 5 (:frame-num header)))
       (is (= 2 (:idr-pic-id header)))
       (is (= 40 (:slice-qp header))))))
@@ -50,5 +50,5 @@
           bytes (eg/bytes! w)
           r (eg/reader bytes)
           _ (eg/bits! r 8)
-          header (slice/parse-header! r sps pps-no-dbf 5)]
+          header (slice/parse-header! r sps pps-no-dbf 5 3)]
       (is (= 26 (:slice-qp header))))))

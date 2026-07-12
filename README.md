@@ -23,10 +23,14 @@ pixel-decode scope** (ADR-2607122000, `com-junkawasaki/root`): this repo
 now also implements a real, non-realtime, CAVLC + intra-only H.264
 baseline pixel decoder (`h264.decode` et al., see "Pixel decode" below),
 chroma (4:2:0) decode, the encode-side counterpart (`h264.encode`, Migration
-step 8, initially luma-only), and — most recently — real chroma (Cb/Cr)
-encode (see "Pixel encode" below). The original framing-only boundary still
-holds for **CABAC** and inter prediction — those remain out of scope (see
-below for exactly what is/isn't covered).
+step 8, initially luma-only), real chroma (Cb/Cr) encode (see "Pixel
+encode" below), and — most recently — a first increment of **P-slice
+inter prediction decode** (`decode-gop`, Migration step 7's first
+increment: P_Skip + P_L0_16x16, MV=(0,0) motion compensation only, single
+reference frame — see "Pixel decode: P-slice (inter)" below). The original
+framing-only boundary still holds for **CABAC**, sub-pel/multi-reference/
+B-slice inter prediction, and inter-side ENCODE — those remain out of
+scope (see below for exactly what is/isn't covered).
 
 ## Namespaces
 
@@ -37,14 +41,14 @@ below for exactly what is/isn't covered).
 | `h264.expgolomb` | decode: MSB-first bit reader + Exp-Golomb `ue(v)`/`se(v)` decode (H.264 §9.1). encode: matching bit `writer` + `write-ue!`/`write-se!`/`write-bits!`/`write-flag!`/`rbsp-trailing-bits!`/`bytes!` |
 | `h264.sps` | decode: SPS (NAL type 7) parse: profile/level + picture width/height (handles high-profile chroma/scaling-list fields correctly so the bit position stays aligned, though scaling-list *values* aren't surfaced). encode: `encode`, non-high-profile only, no frame-cropping (width/height must be multiples of 16) — see Encoding below |
 | `h264.pps` | decode: PPS (NAL type 8) parse: entropy coding mode (CAVLC/CABAC), reference index defaults, QP/deblocking/intra-pred flags. Covers the common case (`num_slice_groups_minus1 == 0` — FMO is essentially absent from real-world encoders); throws rather than silently mis-parsing if FMO is present. High-Profile-only trailing fields (`transform_8x8_mode_flag` etc., gated by `more_rbsp_data()`) aren't parsed — this reader doesn't track exact bit position precisely enough to detect that condition. encode: `encode`, covers the same field set as `parse` |
-| `h264.slice` | decode: slice header parse (`first_mb_in_slice`/`slice_type`/`pic_parameter_set_id`/`frame_num`/`idr_pic_id`/POC (type 0 or 2 only)/IDR dec_ref_pic_marking flags/`slice_qp_delta`/deblocking-control fields, read-and-discarded). `parse-header!` advances the SAME reader `h264.decode` continues using for macroblock data (unlike `sps`/`pps`'s private-reader `parse`) |
+| `h264.slice` | decode: slice header parse (`first_mb_in_slice`/`slice_type`/`pic_parameter_set_id`/`frame_num`/`idr_pic_id`/POC (type 0 or 2 only)/IDR dec_ref_pic_marking flags/`slice_qp_delta`/deblocking-control fields, read-and-discarded). `parse-header!` advances the SAME reader `h264.decode` continues using for macroblock data (unlike `sps`/`pps`'s private-reader `parse`). ALSO: P-slice fields (`num_ref_idx_active_override_flag`/`num_ref_idx_l0_active_minus1` — must resolve to exactly 1 active reference — `ref_pic_list_modification_flag_l0`/weighted-prediction/non-IDR `dec_ref_pic_marking` — all throw if set to anything beyond this repo's single-reference-frame, no-reordering, no-weighting scope), see "Pixel decode: P-slice (inter)" below |
 | `h264.quant` | dequantization: the `normAdjust4x4` V-table (§8.5.9) + per-position `ac-qmul`/single-scalar `dc-qmul`. Implements `codec-primitives.quant/QuantScale`. Baseline scope only — no custom scaling lists (flat weight 16 everywhere) |
 | `h264.transform` | decode: the integer 4x4 inverse transform (`inverse-4x4`, §8.5.10) + the Intra16x16 luma DC Hadamard transform (`luma-dc-hadamard`) + the chroma-DC 2x2 Hadamard transform (`chroma-dc-hadamard`). Arithmetic ported 1:1 from FFmpeg's reference decoder for bit-exactness, including an internal coefficient-array transpose whose necessity was discovered empirically (see "Pixel decode" below). encode: `forward-4x4` (textbook forward transform, API symmetry/DC-extraction only) + `forward-luma-dc-hadamard` (exact derived inverse of `luma-dc-hadamard`) + `forward-chroma-dc-hadamard` (exact derived inverse of `chroma-dc-hadamard`, same probe-and-invert methodology) — see "Pixel encode" below |
 | `h264.cavlc` | decode: CAVLC residual entropy decode (§9.2): `coeff_token`/`total_zeros`/`run_before` VLC tables (luma AND the ChromaArrayType 1 chroma-DC `nC==-1` special case) + `residual-block!` (coeff_token → trailing-ones signs → level_prefix/suffix → total_zeros → run_before → position reconstruction). encode: `encode-residual-block!`, reusing the same tables as reverse lookups (already generic over `:chroma-dc` — no chroma-specific CAVLC encode code was needed) |
 | `h264.encode` | encode-side orchestration: quantization (exact least-squares solve, NOT a memorized MF table, reused unchanged for chroma via QPc) → CAVLC → simplified SAD-based mode decision (luma Intra_16x16 AND chroma Intra_Chroma, jointly for Cb+Cr) → macroblock loop → NAL assembly. LUMA AND CHROMA (Cb/Cr, 4:2:0). See "Pixel encode" below |
 | `h264.intra-pred` | Intra_16x16 luma prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws. Intra_Chroma prediction (§8.3.4, 4:2:0 8x8 blocks, `predict-chroma-8x8`): ALL FOUR modes (DC/Horizontal/Vertical/Plane) on decode — see "Chroma decode" below for why Plane is implemented here but not for luma; encode's mode decision only ever selects DC/Horizontal/Vertical (see "Pixel encode") |
 | `h264.quant` | (also) `chroma-qp`: QPc derivation from QPy + PPS `chroma_qp_index_offset` (§8.5.8 Table 8-15) — reused unchanged by `h264.encode`'s chroma path |
-| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. See "Pixel decode" below for exact scope |
+| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. `decode-idr-frame` (single IDR picture, unchanged public API) AND `decode-gop` (a whole IDR+P sequence, new). See "Pixel decode" and "Pixel decode: P-slice (inter)" below for exact scope |
 
 ## Validation
 
@@ -314,6 +318,105 @@ i.e. right-shaped, wrong-valued) output:**
   (`CodedBlockPatternChroma == 2`) — DC-only fixtures don't exercise this
   order at all, so this only surfaces with real multi-component AC
   content. See `h264.decode/decode-chroma-ac-blocks!`'s docstring.
+
+## Pixel decode: P-slice (inter) (Wave 6, ADR-2607122000 Migration step 7's first increment)
+
+`h264.decode/decode-gop` decodes a whole GOP (one IDR I-frame followed by
+zero or more P-frames) in bitstream order — the first time this ecosystem
+decodes inter-predicted pixels, not just intra. `decode-idr-frame` (single
+IDR picture) is UNCHANGED — it still only ever looks at the first IDR
+slice NAL and ignores anything else, so existing callers are unaffected.
+
+**What's implemented:**
+- **Two mb_types**: `P_Skip` (§7.3.5, the whole-picture-covering
+  `mb_skip_run` bookkeeping in `slice_data()` — no `mb_type`/residual bits
+  at all for a skipped macroblock) and `P_L0_16x16` (`mb_type` 0 in a
+  P-slice: one 16x16 partition, one motion vector, `ref_idx_l0` implicit 0
+  since this repo requires `num_ref_idx_l0_active == 1`). `P_L0_L0_16x8`/
+  `P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0` (`mb_type` 1..4, sub-partitioned
+  motion) throw explicitly, matching this repo's existing
+  throw-on-unsupported-mb_type discipline for `I_NxN`/`I_PCM`. Intra
+  macroblocks WITHIN a P-slice (`mb_type` >= 5, `intra_mb_type = mb_type -
+  5` per Table 7-13) are also decoded — real encoders do choose intra
+  macroblocks inside P-slices, and this repo's existing Intra_16x16 decode
+  path (`decode-intra-macroblock-body!`) is reused unchanged, since a
+  P-slice's intra macroblock is pixel-identical to an I-slice's.
+- **Single reference frame**: a P-slice's motion compensation always
+  references the IMMEDIATELY PRECEDING decoded picture (no multi-frame
+  DPB/reference-picture-list machinery). `h264.slice/parse-header!` throws
+  unless `num_ref_idx_l0_active` resolves to exactly 1, unless
+  `ref_pic_list_modification_flag_l0` is 0, and unless PPS
+  `weighted_pred?` is false — reference reordering and weighted prediction
+  are out of scope.
+- **Real median motion-vector prediction** (§8.4.1.3, `mv-predict-16x16`)
+  and the P_Skip-specific predictor special case (§8.4.1.1, `p-skip-mv`) —
+  implemented per spec (median of left/top/top-right-or-top-left
+  neighbors, with the correct "only one ref-idx matches" and "B/C both
+  unavailable → copy A" special cases), NOT hardcoded to always return
+  `[0 0]` — see `h264.decode/mv-predict-16x16`'s docstring.
+- **MV=(0,0) motion compensation ONLY** (`mc-predict`/`copy-block`): a
+  direct, unfiltered pixel copy of the co-located reference-frame block.
+  If the ACTUAL derived motion vector (predictor + mvd, or the P_Skip
+  predictor alone) is anything other than `[0 0]`, `decode-p-skip-macroblock!`/
+  `decode-inter-16x16-macroblock!` throw a clear, explicit error rather
+  than silently mis-decoding — sub-pel (6-tap luma / bilinear chroma) AND
+  integer-pel-but-nonzero motion compensation are BOTH out of scope for
+  this increment (even an integer-pixel luma shift generally implies a
+  fractional CHROMA shift under 4:2:0 subsampling whenever the shift is an
+  odd number of luma pixels, which would need chroma interpolation — see
+  `h264.decode/mc-predict`'s docstring). This was found to matter in
+  practice, not just in theory: real libx264 encodes of smooth-gradient
+  test content reliably chose non-zero (but still purely integer-pel)
+  motion vectors (`[0 4]`/`[0 16]`/`[0 32]` observed across several
+  fixtures during development) even at very restrictive `--merange`/`--me
+  dia`/`--subme 0` settings, because ANY spatial correlation gives real
+  motion search an incentive to explore a shift — see the P-slice test
+  fixtures' own docstring (`test/h264/decode_p_slice_test.clj`) for why
+  2 of the 3 golden vectors are hand-authored rather than x264 output.
+- **Inter luma residual**: unlike Intra_16x16 (which has a separate
+  macroblock-level DC/Hadamard block plus 15-coefficient AC blocks), an
+  inter (or `I_NxN`) macroblock's 16 luma 4x4 blocks are each a FULL
+  16-coefficient regular block (`decode-regular-block!`, all 16 positions
+  — including [0,0] — dequantized via the same per-position `ac-qmul`
+  formula AC blocks already use). `CodedBlockPatternLuma` gates each of
+  the 4 8x8 quadrants independently (1 bit each, `bit-test`) rather than
+  being inferred all-or-nothing from `mb_type` the way Intra16x16's is.
+- **`coded_block_pattern` (§9.1.2 Table 9-4 ME(v) mapping, Inter column
+  only)**: `golomb-to-inter-cbp`, transcribed from FFmpeg's
+  `ff_h264_golomb_to_inter_cbp` (`libavcodec/h264data.c`) and verified to
+  be a full permutation of 0..47. The Intra_4x4/Intra_8x8 CBP-mapping
+  column is NOT implemented, since this repo's decoder never reaches that
+  case (`I_NxN` throws before any CBP read would happen).
+- **Chroma residual is UNCHANGED** — `decode-chroma-dc!`/
+  `decode-chroma-ac-blocks!` are reused as-is for inter macroblocks; the
+  chroma DC(2x2 Hadamard)+AC residual structure doesn't depend on the luma
+  macroblock type at all.
+
+**What's explicitly NOT implemented** (out of scope, not silently wrong):
+CABAC (unchanged from the I-slice-only scope), B-slices, multiple
+reference frames / a real DPB, reference-list reordering, weighted
+prediction, adaptive (MMCO) reference-picture marking,
+`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0` (sub-partitioned
+motion), and — critically — any motion vector other than exactly `[0 0]`
+(no sub-pel interpolation, no nonzero-but-integer-pel motion
+compensation). The encode side has NOT been extended for P-slices at all
+— `h264.encode` remains IDR-only.
+
+**Validation.** `test/h264/decode_p_slice_test.clj` covers 3 golden
+vectors, all bit-exact (no tolerance) against real `ffmpeg 8.1.1`:
+`p-skip-flat16.h264` (REAL libx264 output — 2 identical flat-gray frames,
+100% P_Skip), and `p-16x16-mb0-realac.h264`/
+`p-skip-then-16x16-multimb.h264` (hand-authored using this repo's OWN
+already-bit-exact-tested encode-side primitives — `h264.encode` for the
+IDR reference frame, `h264.expgolomb`/`h264.cavlc` for a hand-built
+spec-valid P-slice NAL — because real encoders essentially never choose
+`P_L0_16x16` with a genuinely zero final motion vector AND nonzero
+residual for content that also keeps the reference frame's own intra
+coding within this repo's Intra_16x16-only scope, see that test file's
+own docstring for the full explanation and exactly why this is still a
+genuine independent-decoder cross-check, not a self-consistency
+tautology: real ffmpeg decodes these exact hand-authored bytes without
+having seen or trusted anything about how they were constructed).
 
 ## Pixel encode (Wave 5, ADR-2607122000 Migration step 8 + chroma-encode follow-up)
 
