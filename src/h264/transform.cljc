@@ -3,8 +3,15 @@
    ISO/IEC 14496-10 §8.5.10 \"Transformation process for residual 4x4
    blocks\") + the Intra16x16 luma DC Hadamard transform (§8.5.10, luma DC
    transform coefficients). Implements `codec-primitives.transform/BlockTransform`
-   for the regular 4x4 residual block. Decode-only: `forward` throws (this
-   repo is a decoder, not an encoder, for the pixel-codec layer).
+   for the regular 4x4 residual block.
+
+   Encode side (ADR-2607122000 Migration step 8): `forward-4x4` (textbook
+   forward transform, used for DC extraction — see its own docstring for
+   why it is NOT used for AC quantization) and `forward-luma-dc-hadamard`
+   (the exact linear inverse of `luma-dc-hadamard`, empirically derived —
+   see that fn's docstring). The actual AC-coefficient quantizer used by
+   `h264.encode` is NOT in this namespace — it solves the exact
+   least-squares inverse of `ac-qmul`+`inverse-4x4` directly.
 
    The exact butterfly arithmetic (including the `+32`/`>>6` rounding
    constants) is ported from FFmpeg's reference decoder
@@ -200,10 +207,132 @@
     [(sc (+ a' c')) (sc (+ e b'))
      (sc (- a' c')) (sc (- e b'))]))
 
+;; --- encode side (Wave 3 addition, kotoba-lang/root ADR-2607122000 Migration
+;;     step 8: 量子化→変換→CAVLC→簡易モード決定 encode-side pipeline) ---
+
+(defn- row-fwd
+  "1-D 4-point forward butterfly, the textbook H.264 core forward transform
+   row/column operator (matrix [[1 1 1 1][2 1 -1 -2][1 -1 -1 1][1 -2 2 -1]]
+   applied via a fast butterfly, the standard documented dual shape of the
+   spec's inverse butterfly). Used by `forward-4x4` below."
+  [x0 x1 x2 x3]
+  (let [e0 (+ x0 x3) e1 (+ x1 x2) e2 (- x1 x2) e3 (- x0 x3)]
+    [(+ e0 e1) (+ (* 2 e3) e2) (- e0 e1) (- e3 (* 2 e2))]))
+
+(defn forward-4x4
+  "Standard H.264 core forward 4x4 integer transform (the textbook
+   encoder-side dual shape of `inverse-4x4`'s butterfly — separable
+   row-then-column application of `row-fwd`). Takes a 4x4 PIXEL-DOMAIN
+   residual grid (vector of 4 row vectors), returns the UNQUANTIZED
+   transform-domain 4x4 grid (same shape).
+
+   IMPORTANT, stated honestly rather than glossed over: this is provided
+   for API symmetry with `inverse-4x4` and for the one property this repo's
+   encoder actually relies on it for — `(get-in (forward-4x4 block) [0 0])`
+   is the block's DC (sum-of-samples) term, used by `h264.encode`'s
+   Intra16x16 luma-DC path — NOT as the numerically-exact dual of
+   `inverse-4x4` for the AC (non-DC) positions. Empirically (see ADR/session
+   notes for the probe scripts), composing this `forward-4x4` with this
+   repo's own tested `ac-qmul`/`inverse-4x4` pipeline leaves measurably MORE
+   cross-coefficient leakage (~20%) than the pipeline's OWN inherent
+   non-orthogonality (~2%, i.e. `M = Ci · diag(ac-qmul)` is not perfectly
+   diagonal even before any forward-transform choice — a real, expected
+   property of H.264's integer transform, not a bug). Rather than trust an
+   textbook-remembered pairing that measurably underperforms, `h264.encode`
+   quantizes AC coefficients by solving the EXACT linear least-squares
+   inverse of the real (already bit-exact-vs-ffmpeg-tested) `ac-qmul` +
+   `inverse-4x4` pipeline directly from pixel-domain residuals, bypassing
+   this fn for that purpose entirely. See `h264.encode`'s namespace
+   docstring for the full derivation."
+  [block]
+  (let [rows (mapv (fn [row] (vec (apply row-fwd row))) block)
+        cols (vec (for [c (range 4)] (mapv #(nth % c) rows)))
+        cols-t (mapv (fn [col] (vec (apply row-fwd col))) cols)]
+    (vec (for [r (range 4)] (vec (for [c (range 4)] (nth (nth cols-t c) r)))))))
+
+(def dc-hadamard-fwd-matrix
+  "16x16 integer matrix `H` such that the EXISTING, tested `luma-dc-hadamard`
+   (called with `qmul=256`, which makes its internal `sc` scaling the
+   identity, exposing the raw linear map) computes
+   `dc-per-block[b] = sum_p (H[b][p] * dc-raster[p])` for every unit-impulse
+   `dc-raster`. This was empirically PROBED (not hand-derived or
+   remembered) by unit-impulse-testing `luma-dc-hadamard` directly — see
+   ADR-2607122000 session notes for the probe script. Self-consistency was
+   verified programmatically: `H * H^T = 16 * I` exactly (an integer
+   identity — checked in `transform_test.clj`), proving `H` is invertible
+   with `H^-1 = H^T / 16`. `forward-luma-dc-hadamard` below uses this exact
+   inverse relationship — not a separately-derived formula — to guarantee
+   its output is the precise linear inverse of the already bit-exact-vs-
+   real-ffmpeg-verified decode path.
+
+   Re-probed (values below regenerated, not hand-edited) after
+   `luma-dc-hadamard` gained its internal `transpose16` fix
+   (multi-macroblock Horizontal-prediction desync fix, see that fn's own
+   docstring) — the probe is mechanical and platform/version-agnostic (it
+   just calls the real, current `luma-dc-hadamard`), so this matrix always
+   tracks whatever that function's CURRENT behavior actually is."
+  [[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]
+   [1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 -1]
+   [1 1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1]
+   [1 1 -1 -1 1 1 -1 -1 -1 -1 1 1 -1 -1 1 1]
+   [1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1]
+   [1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 1 -1]
+   [1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 -1 1 1 -1]
+   [1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 -1 1 -1 1]
+   [1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1]
+   [1 1 -1 -1 -1 -1 1 1 -1 -1 1 1 1 1 -1 -1]
+   [1 1 1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1]
+   [1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1 1 1]
+   [1 -1 -1 1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 1]
+   [1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 1 -1]
+   [1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1 1 -1]
+   [1 -1 1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1]])
+
+(defn- floor-div
+  "Portable floor division (integer `a`, positive integer `b`) — avoids
+   platform-specific `Math/floor` (this is a `.cljc` file, kept portable per
+   the rest of this repo's arithmetic style, which uses only `quot`/`rem`/
+   bit-shift operations, no JVM-only interop)."
+  [a b]
+  (let [q (quot a b) r (rem a b)]
+    (if (neg? r) (dec q) q)))
+
+(defn- round-half-up-frac
+  "Round the fraction `n/d` (integers, `d` positive) to the nearest integer,
+   ties rounding away from negative infinity (`floor(n/d + 1/2)`) —
+   portable, no `Math/` interop."
+  [n d]
+  (floor-div (+ (* 2 n) d) (* 2 d)))
+
+(defn forward-luma-dc-hadamard
+  "Encode-side exact dual of `luma-dc-hadamard`. `target-dc-per-block` is 16
+   values indexed by blk-idx b (SAME indexing `luma-dc-hadamard` returns —
+   i.e. index b is the desired transform-domain DC coefficient of the 4x4
+   luma block at spatial position `h264.decode/blk->col-row[b]`, typically
+   just the sum of that block's pixel-domain residual samples — see
+   `h264.encode`). `qmul` is this macroblock's `h264.quant/dc-qmul`.
+
+   Returns the 16 raw (quantized, CAVLC-ready) integer DC levels in RASTER
+   order (idx=row*4+col, BEFORE zigzag scan — matches `luma-dc-hadamard`'s
+   own `dc-raster` input convention) such that calling the real, tested
+   `luma-dc-hadamard` on the zigzag-unscanned version of these levels
+   reproduces `target-dc-per-block` up to integer rounding (this rounding
+   IS the lossy-compression quantization step, by design — not an
+   implementation defect).
+
+   Derived as the exact matrix inverse of `dc-hadamard-fwd-matrix`
+   (`H^-1 = H^T / 16`, see that def's docstring), NOT a separately
+   re-derived or memorized formula."
+  [target-dc-per-block qmul]
+  (vec (for [p (range 16)]
+         (let [s (reduce + (map (fn [b] (* (get-in dc-hadamard-fwd-matrix [b p])
+                                            (nth target-dc-per-block b)))
+                                 (range 16)))]
+           (round-half-up-frac (* 16 s) qmul)))))
+
 (defrecord H264BlockTransform []
   cp-transform/BlockTransform
-  (forward [_ _block]
-    (throw (ex-info "h264.transform: forward (encode) not implemented — decode-only scope" {})))
+  (forward [_ block] (forward-4x4 block))
   (inverse [_ coeffs] (inverse-4x4 coeffs)))
 
 (def block-transform

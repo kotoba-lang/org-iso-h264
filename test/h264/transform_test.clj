@@ -1,7 +1,9 @@
 (ns h264.transform-test
   (:require [clojure.test :refer [deftest is testing]]
             [h264.transform :as transform]
-            [codec-primitives.transform :as cp-transform]))
+            [h264.quant :as quant]
+            [codec-primitives.transform :as cp-transform]
+            [codec-primitives.scan :as scan]))
 
 (deftest inverse-4x4-all-zero
   (testing "an all-zero coefficient block has zero residual (rounding bias/64 truncates to 0)"
@@ -30,10 +32,46 @@
     (is (= (transform/inverse-4x4 (vec (repeat 16 0)))
            (cp-transform/inverse transform/block-transform (vec (repeat 16 0)))))))
 
-(deftest block-transform-forward-not-implemented
-  (testing "forward (encode) throws — this repo is decode-only for the pixel-codec layer"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (cp-transform/forward transform/block-transform [[0 0 0 0] [0 0 0 0] [0 0 0 0] [0 0 0 0]])))))
+(deftest block-transform-protocol-forward
+  (testing "BlockTransform protocol's forward delegates to forward-4x4 (Wave 3 encode addition)"
+    (is (= (transform/forward-4x4 [[1 2 3 4] [5 6 7 8] [9 10 11 12] [13 14 15 16]])
+           (cp-transform/forward transform/block-transform [[1 2 3 4] [5 6 7 8] [9 10 11 12] [13 14 15 16]])))))
+
+(deftest forward-4x4-dc-is-sum-of-samples
+  (testing "forward-4x4's position [0][0] (DC term) is the sum of all 16 samples — true by construction for ANY correct block transform's zero-frequency term, used by h264.encode's luma-DC path"
+    (let [block [[1 2 3 4] [5 6 7 8] [9 10 11 12] [13 14 15 16]]]
+      (is (= (reduce + (apply concat block)) (get-in (transform/forward-4x4 block) [0 0]))))))
+
+(deftest forward-4x4-zero-block
+  (testing "forward-4x4 of an all-zero block is all-zero"
+    (is (= [[0 0 0 0] [0 0 0 0] [0 0 0 0] [0 0 0 0]]
+           (transform/forward-4x4 [[0 0 0 0] [0 0 0 0] [0 0 0 0] [0 0 0 0]])))))
+
+(deftest dc-hadamard-fwd-matrix-self-consistent
+  (testing "H * H^T = 16*I exactly (empirically probed against luma-dc-hadamard, see def docstring) — confirms H is invertible with H^-1 = H^T/16, which forward-luma-dc-hadamard relies on"
+    (let [H transform/dc-hadamard-fwd-matrix
+          Ht (vec (for [j (range 16)] (vec (for [i (range 16)] (get-in H [i j])))))
+          mat-mul (fn [A B] (vec (for [i (range 16)]
+                                    (vec (for [j (range 16)]
+                                           (reduce + (for [k (range 16)] (* (get-in A [i k]) (get-in B [k j])))))))))
+          HHt (mat-mul H Ht)]
+      (doseq [i (range 16) j (range 16)]
+        (is (= (if (= i j) 16 0) (get-in HHt [i j]))
+            (str "H*H^T[" i "][" j "] should be " (if (= i j) 16 0)))))))
+
+(deftest forward-luma-dc-hadamard-roundtrips-through-real-decode
+  (testing "forward-luma-dc-hadamard is the exact linear inverse of luma-dc-hadamard (up to integer rounding): encoding a target DC-per-block array then decoding it back via the REAL, tested luma-dc-hadamard reproduces the target within a small, bounded quantization error"
+    (let [qp 26
+          qmul (quant/dc-qmul qp)
+          target (vec (repeatedly 16 #(- (rand-int 4001) 2000)))
+          raster (transform/forward-luma-dc-hadamard target qmul)
+          scanned (scan/scan scan/zigzag-4x4 raster)
+          raster-back (scan/unscan scan/zigzag-4x4 scanned)
+          decoded (transform/luma-dc-hadamard raster-back qmul)]
+      (is (= raster raster-back) "zigzag scan/unscan round-trips the raster exactly")
+      (doseq [[t d] (map vector target decoded)]
+        (is (<= (Math/abs (- t d)) 300)
+            "reconstructed DC should be within a small bounded quantization error of the target")))))
 
 (deftest luma-dc-hadamard-single-impulse-spreads-uniformly
   (testing "luma-dc-hadamard is a real (non-identity) transform: a DC-domain impulse at (0,0) spreads to the same magnitude across all 16 blocks (forward Hadamard of a constant spatial block collapses to a single DC-domain impulse, so the inverse must do the reverse: spread it back out uniformly)"
