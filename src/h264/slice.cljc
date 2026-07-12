@@ -168,3 +168,58 @@
   (when deblocking-filter-control-present?
     (eg/write-ue! w 1))
   nil)
+
+(defn encode-p-header!
+  "Write a P-slice slice_header (§7.3.3) to `w` — the P-slice counterpart of
+   `encode-header!` (which is I-slice only), ADR-2607122000 P-slice encode
+   increment (`h264.encode`'s P_Skip/P_L0_16x16 encoder). Scope mirrors
+   `parse-header!`'s own P-slice decode scope exactly (single reference
+   frame, no reordering, no weighted prediction — see that fn's docstring):
+   `first_mb_in_slice` fixed to 0, `slice_type` fixed to 5 (the encoder-
+   preferred all-slices-P-type value, Table 7-6 — decodable exactly like
+   plain P (0) by `h264.slice/slice-type-class`, which collapses both to
+   `:p`), `pic_order_cnt_type` fixed to 0 (matching `h264.sps/encode`'s own
+   fixed choice, so only `log2_max_pic_order_cnt_lsb_minus4` — always 0 —
+   bits are written, all zero), `num_ref_idx_active_override_flag` always
+   written false (uses the PPS's own default active count — this repo's
+   `h264.pps/encode` DEFAULTS `num-ref-idx-l0-default-active` to 1, exactly
+   the single-reference-frame requirement `parse-header!` enforces, so no
+   override is ever needed), `ref_pic_list_modification_flag_l0` always
+   written false (no reference reordering), no `pred_weight_table` (PPS
+   `weighted_pred?` must be false, matching `pps/encode`'s default — this fn
+   doesn't check, since it can't write nonexistent bits; passing a
+   weighted-prediction PPS here would silently produce a stream
+   `parse-header!` throws on).
+
+   `nal-ref-idc` (an opts key, default 0) MUST equal the containing NAL
+   header's actual 3-bit `nal_ref_idc` value the caller writes — this gates
+   whether `adaptive_ref_pic_marking_mode_flag` is written at all (mirrors
+   `parse-header!`'s `(when (not (zero? nal-ref-idc)) ...)` read gate
+   exactly); when written (nonzero `nal-ref-idc`), it's always `false` (no
+   MMCO/adaptive reference marking — this repo's single-reference-frame,
+   no-DPB scope has nothing to mark)."
+  [w {:keys [log2-max-frame-num-minus4]}
+   {:keys [pic-init-qp deblocking-filter-control-present? redundant-pic-cnt-present?]}
+   {:keys [frame-num slice-qp nal-ref-idc]
+    :or {nal-ref-idc 0}}]
+  (eg/write-ue! w 0)                                        ; first_mb_in_slice
+  (eg/write-ue! w 5)                                        ; slice_type = 5 (all P)
+  (eg/write-ue! w 0)                                        ; pic_parameter_set_id
+  (eg/write-bits! w (+ log2-max-frame-num-minus4 4) frame-num)
+  ;; no idr_pic_id (this is a non-IDR slice, nal_unit_type=1 — see
+  ;; `parse-header!`'s `idr?` gate, which is false here).
+  ;; pic_order_cnt_type is always 0 (h264.sps/encode's own fixed choice) —
+  ;; log2_max_pic_order_cnt_lsb_minus4 is always 0 there too, so exactly 4
+  ;; bits of pic_order_cnt_lsb are written (all zero — POC value is
+  ;; immaterial for this repo's single-slice-per-picture scope).
+  (eg/write-bits! w 4 0)
+  (when redundant-pic-cnt-present?
+    (eg/write-ue! w 0))
+  (eg/write-flag! w false)                                  ; num_ref_idx_active_override_flag
+  (eg/write-flag! w false)                                  ; ref_pic_list_modification_flag_l0
+  (when (not (zero? nal-ref-idc))
+    (eg/write-flag! w false))                                ; adaptive_ref_pic_marking_mode_flag
+  (eg/write-se! w (- slice-qp pic-init-qp))                 ; slice_qp_delta
+  (when deblocking-filter-control-present?
+    (eg/write-ue! w 1))
+  nil)

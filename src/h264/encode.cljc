@@ -106,6 +106,7 @@
             [h264.transform :as transform]
             [h264.intra-pred :as intra-pred]
             [h264.decode :as decode]
+            [h264.interp :as interp]
             [codec-primitives.scan :as scan]))
 
 (def zigzag scan/zigzag-4x4)
@@ -228,6 +229,61 @@
            (let [level (nth ac-levels (dec pos))
                  row (quot pos 4) col (mod pos 4)]
              (if (zero? level) 0 (bit-shift-right (+ (* level (quant/ac-qmul qp row col)) 32) 6)))))))
+
+;; --- P-slice inter residual quantization (Wave 6 encode increment,
+;;     ADR-2607122000 Migration step 7's encode-side counterpart). An inter
+;;     (P_L0_16x16) 4x4 luma block is a FULL 16-coefficient "regular" block
+;;     (`h264.decode/decode-regular-block!`) — unlike Intra16x16, there is
+;;     NO separate macroblock-level DC/Hadamard block; raster position 0
+;;     dequantizes via the SAME per-position `ac-qmul` formula as every
+;;     other position (already true of `level-pixel-matrix` above — it was
+;;     built by probing `ac-qmul`/`inverse-4x4` at EVERY raster position
+;;     0..15 uniformly, so no new probing is needed, just a solver that
+;;     DOESN'T exclude column 0 the way `ac-solver` deliberately does for
+;;     the Intra16x16 AC path). ---
+
+(def ^:private regular-solver-cache (atom {}))
+
+(defn- regular-solver
+  "Memoized per-QP: like `ac-solver`, but over the FULL 16x16
+   `level-pixel-matrix` (no DC column excluded) — the exact least-squares
+   solve for all 16 raster-position integer levels of an inter (or I_NxN)
+   regular 4x4 residual block."
+  [qp]
+  (or (@regular-solver-cache qp)
+      (let [M (level-pixel-matrix qp)
+            MT (mat-transpose M)
+            MTM (mat-mul MT M)
+            inv (mat-inverse MTM)
+            result [MT inv]]
+        (swap! regular-solver-cache assoc qp result)
+        result)))
+
+(defn- solve-regular-levels
+  "Solve all 16 raster-position integer CAVLC levels for one 4x4 inter
+   block's target pixel-domain residual (`target-flat`, 16 values, raster
+   idx=row*4+col), via `regular-solver`. Returns a 16-element vector indexed
+   by RASTER position directly (unlike `solve-ac-levels`, which is shifted
+   by 1 since it excludes the DC position)."
+  [qp target-flat]
+  (let [[MT inv] (regular-solver qp)
+        rhs (mat-vec-mul MT target-flat)
+        sol (mat-vec-mul inv rhs)]
+    (mapv round-nearest sol)))
+
+(defn- regular-dequant-raster
+  "Given 16 raster-position integer levels (from `solve-regular-levels`) and
+   `qp`, returns the 16-element DEQUANTIZED raster array — matches
+   `h264.decode/decode-regular-block!`'s own dequant formula exactly (EVERY
+   position, including 0, through `ac-qmul` — no DC overlay, unlike
+   `ac-dequant-raster`)."
+  [qp levels]
+  (vec (for [pos (range 16)]
+         (let [level (nth levels pos)]
+           (if (zero? level)
+             0
+             (let [row (quot pos 4) col (mod pos 4)]
+               (bit-shift-right (+ (* level (quant/ac-qmul qp row col)) 32) 6)))))))
 
 (defn- neighbor-nc
   "Same neighbor-nC averaging `h264.decode/neighbor-nc` uses (duplicated
@@ -623,3 +679,451 @@
                                          (bs/write-nal-unit pps-rbsp)
                                          (bs/write-nal-unit slice-bytes)])]
     {:bytes stream :mb-states mb-states}))
+
+;; --- P-slice (inter) encode (Wave 6 encode increment, ADR-2607122000
+;;     Migration step 7's encode-side counterpart of `h264.decode/decode-gop`'s
+;;     P_Skip/P_L0_16x16 decode support). Scope, deliberately narrow (mirrors
+;;     `h264.decode`'s own P-slice decode scope exactly, so this encoder's
+;;     output is designed to be decoded by THAT decoder and by any real
+;;     spec-conformant decoder):
+;;
+;;     - Single reference frame: every P-frame's motion estimation/
+;;       compensation references the IMMEDIATELY PRECEDING frame in the GOP
+;;       (the OWN reconstructed pixels of that frame, not the original
+;;       source — matching what a real decoder will actually have available,
+;;       same "encoder reconstructs from its own dequantized output" design
+;;       already used for intra neighbor state above).
+;;     - Two mb_types: P_Skip (mv = the P_Skip predictor, §8.4.1.1, NO
+;;       residual) and P_L0_16x16 (one 16x16 partition, one motion vector,
+;;       real CAVLC-coded luma+chroma residual) — no sub-partitioned motion
+;;       (P_L0_L0_16x8/P_L0_L0_8x16/P_8x8/P_8x8ref0), matching
+;;       `h264.decode/decode-macroblock-p!`'s own throw-on-unsupported scope.
+;;       No intra-in-P macroblocks on the ENCODE side (mode decision here
+;;       never emits one, even though decode supports them) — this
+;;       encoder's motion estimation always finds SOME candidate MV, so
+;;       there's no RD reason built into this simplified mode decision to
+;;       fall back to intra.
+;;     - Motion estimation: integer-pel full search over a small
+;;       `search-range` (default ±8 pixels, luma-SAD-minimizing, checked
+;;       against `h264.interp/mc-luma-block` so the SAME sub-pel-capable
+;;       interpolation the decoder uses is what the search itself is scored
+;;       against — no separate "integer-only" fast-path approximation), THEN
+;;       a small quarter-pel LOCAL refinement (`me-subpel-refine`, ±3
+;;       quarter-samples around the best integer position) — REAL sub-pel
+;;       motion vectors are supported end-to-end (this repo's decode side
+;;       already handles any (fx,fy), see `h264.interp`), not just a
+;;       documented gap.
+;;     - P_Skip decision: chosen whenever the P_Skip-predictor MV
+;;       (`p-skip-mv`, the SAME §8.4.1.1 predictor `h264.decode` uses)
+;;       already gives EXACT (zero-SAD) luma prediction — i.e. whenever no
+;;       residual would be needed anyway, so spending bits on an explicit
+;;       P_L0_16x16 mb_type + mvd + coded_block_pattern=0 would be strictly
+;;       wasteful. This is intentionally a much simpler rule than a real
+;;       encoder's full RD mode decision (which would also skip for small-
+;;       but-nonzero residual, trading a little quality for bits) — see
+;;       `encode-p-slice-mbs!`'s docstring.
+;;     - Constant QP across the whole frame, same as `encode-idr-luma-frame`.
+
+;; --- P-slice inter residual is a "regular" 4x4 block for EVERY luma 4x4
+;;     block (no separate DC/Hadamard split) but chroma residual is
+;;     UNCHANGED from the intra path (`h264.decode`'s own docstring: "chroma
+;;     DC(2x2 Hadamard)+AC residual structure doesn't depend on the luma
+;;     macroblock type at all") — so `chroma-component-plan`/
+;;     `encode-chroma-ac-blocks!` above are reused VERBATIM here, just fed a
+;;     motion-compensated (not intra) prediction. ---
+
+(defn- overlay-4x4-blocks
+  "Pure (no bit writes) residual reconstruction: `pred-grid` (row-vector
+   grid, `grid-size`x`grid-size`) + inverse-transformed `block-coeffs`
+   (`num-blocks` 4x4 arrays, indexed per `col-row-fn`'s convention) → full
+   reconstructed grid. Shared by luma (16 blocks, `decode/blk->col-row`) and
+   chroma (4 blocks, `decode/chroma-blk->col-row`) inter reconstruction —
+   mirrors `h264.decode/add-residual-16x16`/`add-residual-8x8` (private
+   there too, hence this small deliberate duplication, same convention
+   `neighbor-nc` above already uses)."
+  [pred-grid block-coeffs num-blocks grid-size col-row-fn]
+  (reduce
+   (fn [recon b]
+     (let [[col row] (col-row-fn b)
+           pred4x4 (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in pred-grid [(+ (* row 4) ry) (+ (* col 4) rx)])))))
+           residual (transform/inverse-4x4 (nth block-coeffs b))]
+       (reduce
+        (fn [recon ry]
+          (reduce
+           (fn [recon rx]
+             (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)]
+                       (clip8 (+ (get-in pred4x4 [ry rx]) (get-in residual [ry rx])))))
+           recon (range 4)))
+        recon (range 4))))
+   (vec (repeat grid-size (vec (repeat grid-size 0))))
+   (range num-blocks)))
+
+(defn- mc-predict
+  "Motion-compensated prediction for the macroblock at (`mb-x`,`mb-y`) given
+   the ALREADY-DERIVED final motion vector `mv` — mirrors
+   `h264.decode/mc-predict` exactly (private there too, same small-
+   deliberate-duplication convention). `ref-frame` is the PREVIOUS frame's
+   OWN reconstructed pixels ({:width :height :luma :cb :cr})."
+  [ref-frame mb-x mb-y mv]
+  (let [w (:width ref-frame) h (:height ref-frame) cw (quot w 2) ch (quot h 2)
+        lx (* mb-x 16) ly (* mb-y 16)
+        cx (* mb-x 8) cy (* mb-y 8)]
+    {:luma-pred (interp/mc-luma-block (:luma ref-frame) w h lx ly mv 16)
+     :cb-pred (interp/mc-chroma-block (:cb ref-frame) cw ch cx cy mv 8)
+     :cr-pred (interp/mc-chroma-block (:cr ref-frame) cw ch cx cy mv 8)}))
+
+;; --- motion vector prediction / P_Skip predictor (§8.4.1.1/§8.4.1.3) —
+;;     mirrors `h264.decode/mv-predict-16x16`/`p-skip-mv`/`neighbor-mv-ref`
+;;     exactly (private there too). The ENCODER must derive mvd from the
+;;     SAME predictor the decoder will reconstruct, or the decoded final mv
+;;     will silently differ from the one this encoder's own motion search
+;;     actually chose. ---
+
+(defn- neighbor-mv-ref
+  [mb]
+  (if (and mb (:inter? mb)) [(:mv mb) 0] [[0 0] -1]))
+
+(defn- median3 [a b c] (- (+ a b c) (min a b c) (max a b c)))
+
+(defn- mv-predict-16x16
+  [left-mb top-mb topleft-mb topright-mb cur-ref-idx]
+  (let [c-mb (or topright-mb topleft-mb)
+        [mvA refA] (neighbor-mv-ref left-mb)
+        [mvB0 refB0] (neighbor-mv-ref top-mb)
+        [mvC0 refC0] (neighbor-mv-ref c-mb)
+        both-unavail? (and (nil? top-mb) (nil? c-mb))
+        [mvB refB mvC refC] (if (and both-unavail? left-mb)
+                               [mvA refA mvA refA]
+                               [mvB0 refB0 mvC0 refC0])
+        cands [[mvA refA] [mvB refB] [mvC refC]]
+        exact-matches (filter #(= cur-ref-idx (second %)) cands)]
+    (if (= 1 (count exact-matches))
+      (first (first exact-matches))
+      [(median3 (nth mvA 0) (nth mvB 0) (nth mvC 0))
+       (median3 (nth mvA 1) (nth mvB 1) (nth mvC 1))])))
+
+(defn- p-skip-mv
+  [left-mb top-mb topleft-mb topright-mb]
+  (let [[mvA refA] (neighbor-mv-ref left-mb)
+        [mvB refB] (neighbor-mv-ref top-mb)]
+    (if (or (nil? left-mb) (nil? top-mb)
+            (and (= refA 0) (= mvA [0 0]))
+            (and (= refB 0) (= mvB [0 0])))
+      [0 0]
+      (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0))))
+
+;; --- motion estimation: integer-pel full search + a small quarter-pel
+;;     local refinement. NOT a claim of realtime-encoder-grade motion
+;;     search (real encoders use hierarchical/diamond search, RDO lambda,
+;;     multiple candidate predictors, etc.) — this is the "簡易" (simplified)
+;;     search this task's own scope allows, mirroring `choose-pred-mode`'s
+;;     existing "try a small candidate set, pick min-SAD" style for intra
+;;     mode decision. ---
+
+(defn- me-full-search
+  "Integer-pel full search: minimize luma SAD between `src` (16x16 grid) and
+   `ref-frame`'s luma plane at the macroblock's zero-motion position offset
+   by (dx,dy) pixels, for dx,dy in `[-search-range,search-range]`. Returns
+   the best MV in QUARTER-luma-sample units (always a multiple of 4 in both
+   components — sub-pel refinement is `me-subpel-refine`'s job)."
+  [src ref-frame mb-x mb-y search-range]
+  (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
+        x0 (* mb-x 16) y0 (* mb-y 16)
+        candidates (for [dy (range (- search-range) (inc search-range))
+                          dx (range (- search-range) (inc search-range))]
+                     [dx dy])
+        [bx by] (apply min-key
+                       (fn [[dx dy]] (sad src (interp/mc-luma-block ref-luma w h x0 y0 [(* dx 4) (* dy 4)] 16)))
+                       candidates)]
+    [(* bx 4) (* by 4)]))
+
+(defn- me-subpel-refine
+  "Quarter-pel LOCAL refinement around `best-mv` (already a multiple of 4,
+   from `me-full-search`): try every quarter-sample offset in ±3 (covering
+   the surrounding integer positions too, redundantly but cheaply — block
+   sizes here are small) and keep whichever minimizes luma SAD. Real,
+   non-multiple-of-4 (half/quarter-pel) motion vectors are a normal outcome
+   of this step, motion-compensated via the SAME `h264.interp` sub-pel path
+   `h264.decode/mc-predict` uses for decode."
+  [src ref-frame mb-x mb-y best-mv]
+  (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
+        x0 (* mb-x 16) y0 (* mb-y 16)
+        [base-mvx base-mvy] best-mv
+        candidates (for [dmy (range -3 4) dmx (range -3 4)]
+                     [(+ base-mvx dmx) (+ base-mvy dmy)])]
+    (apply min-key
+           (fn [[mvx mvy]] (sad src (interp/mc-luma-block ref-luma w h x0 y0 [mvx mvy] 16)))
+           candidates)))
+
+(def ^:private inter-cbp->golomb
+  "Reverse lookup of `h264.decode/golomb-to-inter-cbp` — given an actual
+   CodedBlockPattern value (`cbp-chroma*16 + cbp-luma`), the ue(v) codeNum
+   to write. Exact inverse of the fixed §9.1.2 Table 9-4 Inter-column
+   permutation (`golomb-to-inter-cbp` is cross-checked there to be a full
+   permutation of 0..47, so this reverse map is total over that domain)."
+  (zipmap decode/golomb-to-inter-cbp (range 48)))
+
+(defn- mb-block
+  "Extract the `size`x`size` sub-grid for macroblock (`mb-x`,`mb-y`) from a
+   full-picture row-vector `grid` (`plane->grid`'s output) — same slicing
+   `encode-idr-luma-frame`'s own macroblock loop does inline, factored out
+   here since the P-slice loop needs it for luma AND both chroma planes."
+  [grid mb-x mb-y size]
+  (vec (for [ry (range size)] (subvec (nth grid (+ (* mb-y size) ry)) (* mb-x size) (+ (* mb-x size) size)))))
+
+(defn- encode-p-skip-macroblock!
+  "Materialize one P_Skip macroblock (NO bits written here at all — the
+   `mb_skip_run` bookkeeping is the caller's job, see
+   `encode-p-slice-mbs!`): pure motion-compensated copy via `mc-predict`,
+   zero residual — mirrors `h264.decode/decode-p-skip-macroblock!`'s return
+   shape exactly, so it can serve as `left-mb`/`top-mb` neighbor state for
+   subsequent macroblocks."
+  [qp mb-x mb-y ref-frame mv]
+  (let [{:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)]
+    {:recon luma-pred
+     :qp qp
+     :inter? true
+     :mv mv
+     :ac-nnz (vec (repeat 16 0))
+     :top-row (nth luma-pred 15)
+     :left-col (mapv #(nth % 15) luma-pred)
+     :cb {:recon cb-pred :ac-nnz (vec (repeat 4 0))
+          :top-row (nth cb-pred 7) :left-col (mapv #(nth % 7) cb-pred)}
+     :cr {:recon cr-pred :ac-nnz (vec (repeat 4 0))
+          :top-row (nth cr-pred 7) :left-col (mapv #(nth % 7) cr-pred)}}))
+
+(defn- encode-inter-16x16-macroblock!
+  "Encode one P_L0_16x16 macroblock to writer `w`: `mvd_l0` (2 se(v), the
+   ALREADY-CHOSEN final `mv` minus the median predictor `mvp` —
+   `mv-predict-16x16`, NOT the P_Skip predictor), `coded_block_pattern`
+   (me(v) via `inter-cbp->golomb`, ALWAYS present for this mb_type, matching
+   `h264.decode/decode-inter-16x16-macroblock!`'s unconditional read),
+   `mb_qp_delta` (only if any residual — se(v) 0, constant QP), then luma
+   residual (16 FULL 4x4 `solve-regular-levels`/`regular-dequant-raster`
+   blocks — NOT the Intra16x16 DC/AC split, gated per-8x8-quadrant by
+   `cbp-luma`'s 4 bits, mirroring `h264.decode/decode-regular-block!`'s
+   scope) and chroma residual (`chroma-component-plan`/
+   `encode-chroma-ac-blocks!`, UNCHANGED from the intra path — see namespace
+   docstring). `left-mb`/`top-mb` carry CAVLC neighbor (`:ac-nnz`/chroma)
+   state, same shape `encode-macroblock!`'s intra path and
+   `encode-p-skip-macroblock!` both produce.
+
+   Returns `{:recon :inter? true :mv :ac-nnz :top-row :left-col :cb :cr}` —
+   same shape `encode-p-skip-macroblock!` returns, for use as neighbor
+   state by subsequent macroblocks."
+  [w src src-cb src-cr qp qpc mb-x mb-y left-mb top-mb ref-frame mv mvp]
+  (let [mvd-x (- (first mv) (first mvp))
+        mvd-y (- (second mv) (second mvp))
+        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)
+        residual (mapv (fn [sr pr] (mapv - sr pr)) src luma-pred)
+        levels-per-block
+        (mapv (fn [b]
+                (let [resid-b (block-residual residual b)]
+                  (solve-regular-levels qp (vec (apply concat resid-b)))))
+              (range 16))
+        quadrant-nonzero?
+        (mapv (fn [q] (boolean (some (fn [b] (some (complement zero?) (nth levels-per-block b)))
+                                     (range (* q 4) (+ (* q 4) 4)))))
+              (range 4))
+        cbp-luma (reduce (fn [acc q] (if (nth quadrant-nonzero? q) (bit-or acc (bit-shift-left 1 q)) acc)) 0 (range 4))
+        cb-residual (mapv (fn [sr pr] (mapv - sr pr)) src-cb cb-pred)
+        cr-residual (mapv (fn [sr pr] (mapv - sr pr)) src-cr cr-pred)
+        {cb-dc-raster :dc-raster cb-dc-quad :dc-quad cb-ac-levels-per-block :ac-levels-per-block} (chroma-component-plan cb-residual qpc)
+        {cr-dc-raster :dc-raster cr-dc-quad :dc-quad cr-ac-levels-per-block :ac-levels-per-block} (chroma-component-plan cr-residual qpc)
+        any-chroma-dc-nonzero? (boolean (or (some (complement zero?) cb-dc-raster) (some (complement zero?) cr-dc-raster)))
+        any-chroma-ac-nonzero? (boolean (or (some (fn [lv] (some (complement zero?) lv)) cb-ac-levels-per-block)
+                                             (some (fn [lv] (some (complement zero?) lv)) cr-ac-levels-per-block)))
+        cbp-chroma (cond any-chroma-ac-nonzero? 2 any-chroma-dc-nonzero? 1 :else 0)
+        golomb-code (get inter-cbp->golomb (+ (* cbp-chroma 16) cbp-luma))]
+    (eg/write-ue! w 0)                                     ; p_mb_type = 0 (P_L0_16x16)
+    (eg/write-se! w mvd-x)
+    (eg/write-se! w mvd-y)
+    (eg/write-ue! w golomb-code)                           ; coded_block_pattern (always present)
+    (when (or (pos? cbp-luma) (pos? cbp-chroma))
+      (eg/write-se! w 0))                                  ; mb_qp_delta = 0 — constant QP
+    (let [ac-nnz (atom (vec (repeat 16 0)))
+          block-coeffs
+          (mapv
+           (fn [b]
+             (let [quadrant (quot b 4)]
+               (if-not (bit-test cbp-luma quadrant)
+                 (vec (repeat 16 0))
+                 (let [[col row] (decode/blk->col-row b)
+                       nA (if (pos? col)
+                            (nth @ac-nnz (decode/col-row->blk [(dec col) row]))
+                            (when left-mb (nth (:ac-nnz left-mb) (decode/col-row->blk [3 row]))))
+                       nB (if (pos? row)
+                            (nth @ac-nnz (decode/col-row->blk [col (dec row)]))
+                            (when top-mb (nth (:ac-nnz top-mb) (decode/col-row->blk [col 3]))))
+                       nc (neighbor-nc nA nB)
+                       levels (nth levels-per-block b)
+                       scanned (scan/scan zigzag levels)
+                       total-coeff (cavlc/encode-residual-block! w nc 16 scanned)]
+                   (swap! ac-nnz assoc b total-coeff)
+                   (regular-dequant-raster qp levels)))))
+           (range 16))
+          recon (overlay-4x4-blocks luma-pred block-coeffs 16 16 decode/blk->col-row)
+          ;; Bitstream order (§7.3.5.3.3, UNCHANGED from intra): Cb DC, Cr
+          ;; DC, Cb AC x4, Cr AC x4.
+          _ (when (pos? cbp-chroma)
+              (cavlc/encode-residual-block! w :chroma-dc 4 cb-dc-raster)
+              (cavlc/encode-residual-block! w :chroma-dc 4 cr-dc-raster))
+          {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+          (encode-chroma-ac-blocks! w qpc cbp-chroma cb-dc-quad cb-ac-levels-per-block (:cb left-mb) (:cb top-mb))
+          {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+          (encode-chroma-ac-blocks! w qpc cbp-chroma cr-dc-quad cr-ac-levels-per-block (:cr left-mb) (:cr top-mb))
+          cb-recon (overlay-4x4-blocks cb-pred cb-block-coeffs 4 8 decode/chroma-blk->col-row)
+          cr-recon (overlay-4x4-blocks cr-pred cr-block-coeffs 4 8 decode/chroma-blk->col-row)]
+      {:recon recon
+       :qp qp
+       :inter? true
+       :mv mv
+       :ac-nnz @ac-nnz
+       :top-row (nth recon 15)
+       :left-col (mapv #(nth % 15) recon)
+       :cb {:recon cb-recon :ac-nnz cb-ac-nnz :top-row (nth cb-recon 7) :left-col (mapv #(nth % 7) cb-recon)}
+       :cr {:recon cr-recon :ac-nnz cr-ac-nnz :top-row (nth cr-recon 7) :left-col (mapv #(nth % 7) cr-recon)}})))
+
+(defn- encode-p-slice-mbs!
+  "Encode all macroblocks of a single P-slice covering the whole picture to
+   writer `w` (the encode-side counterpart of
+   `h264.decode/decode-p-slice-mbs!`'s `mb_skip_run` → `macroblock_layer()`
+   loop structure). For each macroblock address in raster order:
+
+   1. Derive this MB's motion vector predictor `mvp` (`mv-predict-16x16`)
+      and P_Skip predictor `skip-mv` (`p-skip-mv`) from already-encoded
+      neighbor states.
+   2. Score `skip-mv`: motion-compensate via `mc-predict` and compute luma
+      SAD against `src`. If EXACTLY zero (no residual would help at all),
+      choose P_Skip — see namespace docstring for why this is a much
+      simpler rule than a real encoder's RD mode decision.
+   3. Otherwise, run `me-full-search` + `me-subpel-refine` to find a real
+      (possibly sub-pel) motion vector, and encode a P_L0_16x16 macroblock
+      with real residual against THAT vector.
+
+   `mb_skip_run` is buffered across consecutive P_Skip macroblocks and
+   flushed (written) right before the next coded `macroblock_layer()` — or,
+   if the picture ends on a run of skips, after the loop, with no trailing
+   `macroblock_layer()` call (matches `decode-p-slice-mbs!`'s own
+   `do {...} while` structure exactly).
+
+   Returns the per-MB state vector (raster order, same shape
+   `encode-p-skip-macroblock!`/`encode-inter-16x16-macroblock!` both
+   return)."
+  [w qp qpc mb-width mb-height ref-frame luma-grid cb-grid cr-grid search-range]
+  (let [num-mb (* mb-width mb-height)]
+    (loop [addr 0 states [] skip-run 0]
+      (if (= addr num-mb)
+        (do (eg/write-ue! w skip-run) states)
+        (let [mb-x (mod addr mb-width) mb-y (quot addr mb-width)
+              left-mb (when (pos? mb-x) (nth states (dec addr)))
+              top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+              topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+              topright-mb (when (and (pos? mb-y) (< (inc mb-x) mb-width)) (nth states (+ (- addr mb-width) 1)))
+              src (mb-block luma-grid mb-x mb-y 16)
+              src-cb (mb-block cb-grid mb-x mb-y 8)
+              src-cr (mb-block cr-grid mb-x mb-y 8)
+              mvp (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0)
+              skip-mv (p-skip-mv left-mb top-mb topleft-mb topright-mb)
+              skip-pred (:luma-pred (mc-predict ref-frame mb-x mb-y skip-mv))
+              skip-sad (sad src skip-pred)]
+          (if (zero? skip-sad)
+            (let [state (encode-p-skip-macroblock! qp mb-x mb-y ref-frame skip-mv)]
+              (recur (inc addr) (conj states state) (inc skip-run)))
+            (let [best-int-mv (me-full-search src ref-frame mb-x mb-y search-range)
+                  best-mv (me-subpel-refine src ref-frame mb-x mb-y best-int-mv)
+                  _ (eg/write-ue! w skip-run)
+                  state (encode-inter-16x16-macroblock! w src src-cb src-cr qp qpc mb-x mb-y left-mb top-mb ref-frame best-mv mvp)]
+              (recur (inc addr) (conj states state) 0))))))))
+
+(defn- mb-states->plane
+  "Assemble a full-picture flat row-major plane from per-MB `mb-states`,
+   given `blk-size` (16 luma, 8 chroma) and a `recon-fn` selecting which
+   grid out of each MB's state to use — mirrors
+   `h264.decode/decode-picture`'s own `assemble` helper (private there,
+   inlined via `let`, not reachable as a fn — this is a fresh small
+   implementation of the same idea, not a duplication of decode's private
+   code)."
+  [mb-states mb-width plane-w plane-h blk-size recon-fn]
+  (reduce
+   (fn [plane addr]
+     (let [mb-x (mod addr mb-width) mb-y (quot addr mb-width)
+           recon (recon-fn (nth mb-states addr))]
+       (reduce
+        (fn [plane ry]
+          (reduce
+           (fn [plane rx]
+             (assoc plane (+ (* (+ (* mb-y blk-size) ry) plane-w) (* mb-x blk-size) rx)
+                    (get-in recon [ry rx])))
+           plane (range blk-size)))
+        plane (range blk-size))))
+   (vec (repeat (* plane-w plane-h) 0))
+   (range (count mb-states))))
+
+(defn encode-gop
+  "Encode a whole GOP (one IDR I-frame — via THIS namespace's existing
+   `encode-idr-luma-frame` Intra_16x16 encoder — followed by zero or more
+   P-frames, P_Skip/P_L0_16x16 inter prediction) as a single concatenated
+   Annex B elementary stream — the encode-side counterpart of
+   `h264.decode/decode-gop`. See namespace docstring's \"P-slice (inter)
+   encode\" section for exact scope (single reference frame = the
+   immediately-preceding frame's OWN reconstruction, integer + small
+   quarter-pel-refinement motion search, P_Skip whenever the skip predictor
+   already gives zero luma SAD, constant QP).
+
+   `{:width :height :qp :frames :search-range}` — `frames` a vector of
+   `{:luma :cb :cr}` maps (same per-frame shape `encode-idr-luma-frame`
+   accepts; `:cb`/`:cr` optional, defaulting to flat 128), FIRST entry
+   encoded as the IDR frame, the rest as P-frames in order. `search-range`
+   (default 8) is `me-full-search`'s integer-pel search radius in pixels.
+
+   Returns `{:bytes (single Annex B byte vector, all frames' NALs
+   concatenated) :frames (vector, one entry per frame, each
+   `{:mb-states ...}` — IDR's mb-states shape from `encode-idr-luma-frame`,
+   P-frames' from `encode-p-slice-mbs!` — PLUS `:inter?`/`:mv` per-MB for
+   P-frames)}`."
+  [{:keys [width height qp frames search-range] :or {search-range 8}}]
+  (when (empty? frames)
+    (throw (ex-info "h264.encode/encode-gop: at least 1 frame (the IDR) is required" {})))
+  (when (pos? (mod width 16))
+    (throw (ex-info "h264.encode: width must be a multiple of 16" {:width width})))
+  (when (pos? (mod height 16))
+    (throw (ex-info "h264.encode: height must be a multiple of 16" {:height height})))
+  (let [mb-width (quot width 16) mb-height (quot height 16)
+        cw (quot width 2) ch (quot height 2)
+        {idr-bytes :bytes idr-mb-states :mb-states}
+        (encode-idr-luma-frame (merge {:width width :height height :qp qp} (first frames)))
+        sps-rbsp (sps/encode {:profile-idc 66 :level-idc 30 :seq-parameter-set-id 0 :width width :height height})
+        pps-rbsp (pps/encode {:pic-init-qp qp})
+        sps-map (sps/parse (rbsp/unescape sps-rbsp))
+        pps-map (pps/parse (rbsp/unescape pps-rbsp))
+        qpc (quant/chroma-qp qp (:chroma-qp-index-offset pps-map))
+        idr-ref {:width width :height height
+                 :luma (mb-states->plane idr-mb-states mb-width width height 16 :recon)
+                 :cb (mb-states->plane idr-mb-states mb-width cw ch 8 #(:recon (:cb %)))
+                 :cr (mb-states->plane idr-mb-states mb-width cw ch 8 #(:recon (:cr %)))}]
+    (loop [remaining (rest frames)
+           ref-frame idr-ref
+           frame-num 1
+           nal-byte-seqs [idr-bytes]
+           frame-results [{:mb-states idr-mb-states}]]
+      (if (empty? remaining)
+        {:bytes (vec (apply concat nal-byte-seqs)) :frames frame-results}
+        (let [{:keys [luma cb cr]} (first remaining)
+              cb (or cb (vec (repeat (* cw ch) 128)))
+              cr (or cr (vec (repeat (* cw ch) 128)))
+              luma-grid (plane->grid luma width height)
+              cb-grid (plane->grid cb cw ch)
+              cr-grid (plane->grid cr cw ch)
+              w (eg/writer)
+              _ (eg/write-bits! w 8 (bit-or (bit-shift-left 2 5) 1)) ; NAL header: nal_ref_idc=2, nal_unit_type=1 (non-IDR slice)
+              _ (slice/encode-p-header! w sps-map pps-map {:frame-num frame-num :slice-qp qp :nal-ref-idc 2})
+              mb-states (encode-p-slice-mbs! w qp qpc mb-width mb-height ref-frame luma-grid cb-grid cr-grid search-range)
+              _ (eg/rbsp-trailing-bits! w)
+              slice-bytes (eg/bytes! w)
+              nal (bs/write-nal-unit slice-bytes)
+              new-ref {:width width :height height
+                       :luma (mb-states->plane mb-states mb-width width height 16 :recon)
+                       :cb (mb-states->plane mb-states mb-width cw ch 8 #(:recon (:cb %)))
+                       :cr (mb-states->plane mb-states mb-width cw ch 8 #(:recon (:cr %)))}]
+          (recur (rest remaining) new-ref (inc frame-num) (conj nal-byte-seqs nal) (conj frame-results {:mb-states mb-states})))))))
