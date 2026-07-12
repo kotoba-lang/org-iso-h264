@@ -35,9 +35,9 @@ increment: integer-pel full-search + quarter-pel local-refinement motion
 estimation, P_Skip mode decision, P_L0_16x16 CAVLC-coded residual — see
 "Pixel encode: P-slice (inter)" below), and — most recently — a first
 **CABAC (main/high-profile entropy coding) decode** increment
-(`h264.cabac`, I-slice/Intra_16x16/single-macroblock scope so far — see
-"Pixel decode: CABAC" below for exactly what's validated and a known,
-not-yet-root-caused multi-macroblock limitation). The original
+(`h264.cabac`, I-slice/Intra_16x16 scope so far, validated bit-exact
+including multi-macroblock/multi-coefficient content — see "Pixel decode:
+CABAC" below for exactly what's validated). The original
 framing-only boundary still holds for CABAC + P-slice/inter prediction,
 multi-reference/B-slice inter prediction, sub-partitioned motion
 (`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`, both decode and
@@ -407,62 +407,72 @@ a known limitation — see below for exactly which):
 - CABAC ENCODE (this increment is decode-only, mirroring how CAVLC decode
   long preceded CAVLC encode in this repo's own history).
 
-**Known limitation, NOT yet root-caused (read before trusting a CABAC
-result beyond the validated fixtures below).** `test/h264/decode_cabac_test.clj`
-validates 2 real `ffmpeg 8.1.1`/x264-encoded Main-profile fixtures
-bit-exact (no tolerance): `flat16-dc-only-cabac.h264` (single macroblock,
-`coded_block_flag`=0 fast path for every block) and
-`gradient16-ac-cabac.h264` (single macroblock, ONE genuinely significant
-AC coefficient — the first real exercise of
-`significant_coeff_flag`/`coeff_abs_level_minus1`). Both required
-`--no-deblock` for the latter (a real libx264 in-loop deblocking effect
-this decoder — CABAC or CAVLC alike — doesn't implement, same limitation
-as the existing CAVLC `horizontal-multimb64.h264` fixture; confirmed to be
-a deblocking difference and NOT a CABAC bug by manually verifying the
-pre-deblock reconstruction from this decoder's own coefficients, fed
-through the already-tested `h264.transform` pipeline, matched ffmpeg's
-output only once deblocking was disabled).
+**Validated bit-exact (no tolerance), including multi-macroblock/
+multi-coefficient content.** `test/h264/decode_cabac_test.clj` validates 3
+real `ffmpeg 8.1.1`/x264-encoded Main-profile fixtures bit-exact:
+`flat16-dc-only-cabac.h264` (single macroblock, `coded_block_flag`=0 fast
+path for every block), `gradient16-ac-cabac.h264` (single macroblock, ONE
+genuinely significant AC coefficient — the first real exercise of
+`significant_coeff_flag`/`coeff_abs_level_minus1`), and
+`multimb64-cabac.h264` (64x64/16 macroblocks, real DC/Horizontal/Vertical
+prediction with several 4x4 blocks having 3+ significant coefficients,
+some large enough to exercise the EG0 bypass-suffix continuation).
+`gradient16-ac-cabac.h264` required `--no-deblock` (a real libx264 in-loop
+deblocking effect this decoder — CABAC or CAVLC alike — doesn't
+implement, same limitation as the existing CAVLC
+`horizontal-multimb64.h264` fixture; confirmed to be a deblocking
+difference and NOT a CABAC bug by manually verifying the pre-deblock
+reconstruction from this decoder's own coefficients, fed through the
+already-tested `h264.transform` pipeline, matched ffmpeg's output only
+once deblocking was disabled).
 
-**Beyond these two single-macroblock, ≤1-significant-coefficient-per-block
-fixtures, this decoder is NOT yet confirmed bit-exact.** A real
-multi-macroblock CABAC fixture (64x64/16 macroblocks, same recipe as
-`horizontal-multimb64.h264` but Main profile) decodes with fully correct
-high-level structure — `mb_type`/inferred `coded_block_pattern`/
-Intra_16x16 prediction-mode decisions were independently verified to
-EXACTLY match an independently-CAVLC-encoded version of the identical
-source image (same real encoder, same content, different entropy mode),
-and the bitstream framing is internally consistent (`end_of_slice_flag`
-fires at precisely the picture's last macroblock, no early/late
-termination) — but the RECONSTRUCTED PIXELS show small (typically ±1..3,
-occasionally more) discrepancies specifically in 4x4 residual blocks whose
-`coded_block_flag`=1 decode finds 3 OR MORE significant coefficients (a
-real multi-macroblock all-flat-luma/oscillating-chroma fixture, analogous
-to `chroma-multimb32.h264`, shows the SAME pattern in chroma once real
-multi-coefficient chroma AC blocks are involved, ruling out a luma-specific
-cause). The arithmetic-decoding-engine control flow and the `c1`/`c2`
-adaptive context-index state machine for MULTIPLE significant coefficients
-per block (including the reset-to-0 rule after any `coeff_abs_level>1`
-event, and the EG0-bypass-suffix fallback for large magnitudes) were
-independently verified correct via scripted-bit unit tests of
-`h264.cabac/read-coeff-levels!`/`decode-ueg-level!`/
-`decode-exp-golomb-bypass!` in isolation (feeding hand-constructed bin
-sequences and checking the decoded value/context-index sequence against a
-hand-worked expectation) — so the bug, if it is a decode bug at all rather
-than something specific to how these particular real encoder bitstreams
-happen to be constructed, is narrowly scoped to either the real arithmetic
-engine's behavior under longer/more-varied real bit sequences (as opposed
-to the scripted true/false stand-ins the unit tests use in place of the
-real engine) or a context-table transcription error at a specific `c1`/`c2`
-combination not yet spot-checked. **Next step for whoever picks this up:**
-obtain a verbose per-bin CABAC reference trace for one of these
-multi-macroblock fixtures (e.g. the JM reference software's verbose trace
-mode, or a custom-instrumented ffmpeg/OpenH264 debug build) and diff it
-directly against this namespace's own bin sequence — the investigation so
-far has ruled out the shared dequant/transform pipeline (already proven
-correct for even LARGER-magnitude coefficients via the existing, passing
-CAVLC `horizontal-multimb64.h264` fixture), the QP derivation (shared,
-unmodified code path), and the binarization control-flow logic in
-isolation, which narrows the remaining search space considerably.
+**Fixed: multi-macroblock / 3+-significant-coefficient bug
+(`h264.cabac/decode-exp-golomb-bypass!`).** An earlier version of this
+namespace decoded `flat16-dc-only-cabac.h264`/`gradient16-ac-cabac.h264`
+bit-exact but was NOT yet confirmed bit-exact on multi-macroblock content
+— high-level structure (`mb_type`/inferred `coded_block_pattern`/
+Intra_16x16 prediction-mode decisions, cross-checked against an
+independently-CAVLC-encoded version of the same source image) and
+bitstream framing (`end_of_slice_flag` firing exactly at the picture's
+last macroblock) were already correct, but RECONSTRUCTED PIXELS showed
+small (±1..3, occasionally more) discrepancies specifically in 4x4
+residual blocks with 3 OR MORE significant coefficients.
+
+Root cause: the EG0 (order-0 Exp-Golomb) bypass-suffix accumulator in
+`decode-exp-golomb-bypass!` reused the SAME accumulator as the truncated-
+unary PREFIX sum (via `bit-or`) instead of a separate one added at the
+end. A `count`-length unary prefix always sums to exactly `2^count - 1`
+(ALL `count` low bits already 1), so OR-ing `count` MORE suffix bits into
+those SAME bit positions is a silent no-op REGARDLESS of the actual
+suffix value — every `coeff_abs_level_minus1` large enough to reach this
+suffix (i.e. saturating `decode-ueg-level!`'s cMax=13 truncated-unary
+bank, `coeff_abs_level_minus1 >= 14`) silently truncated to the prefix's
+own value. Invisible on both single-MB fixtures (neither has a
+coefficient anywhere near that large); reliably wrong the moment any
+block's real decoded magnitude got large enough to need the suffix — which
+real complex/multi-macroblock content does routinely, matching the
+originally-reported "3 or more significant coefficients" symptom exactly
+(more significant coefficients per block statistically raises the odds at
+least one hits a large enough magnitude, though the true trigger is
+magnitude, not coefficient COUNT per se).
+
+Root-caused via an independent from-scratch Python re-implementation of
+the CABAC arithmetic engine + 460-entry context-init table (cross-checked
+programmatically, zero diffs, against Cisco OpenH264's own
+`common_tables.cpp`/`parse_mb_syn_cabac.cpp`/`decoder_context.h` — the
+same reference this namespace's tables were originally ported from) that
+reproduced the IDENTICAL wrong bin sequence and coefficient values on a
+new multi-macroblock fixture (`multimb64-cabac.h264`) — confirming the
+entropy decode's CONTROL FLOW (which bins get read, in what order,
+against which contexts) was already correct, and narrowing the bug to
+this one arithmetic combination step. Fix (matching OpenH264's own
+`DecodeExpBypassCabac`, which uses two separate accumulators `iSymTmp`/
+`iSymTmp2` added together at the end): the fixed corrected values (`+29`/
+`+89` instead of the previous `+22`/`+78` at the affected block's two
+large-magnitude positions) exactly match an independently-CAVLC-encoded
+reference of near-identical content, and the fixed decoder reproduces
+`multimb64-cabac.h264`'s real ffmpeg reconstruction bit-exact across all
+16 macroblocks (luma AND chroma).
 
 ## Pixel decode: P-slice (inter) (Wave 6, ADR-2607122000 Migration step 7's first increment)
 
