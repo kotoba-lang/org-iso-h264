@@ -54,6 +54,7 @@
             [h264.slice :as slice]
             [h264.expgolomb :as eg]
             [h264.cavlc :as cavlc]
+            [h264.cabac :as cabac]
             [h264.quant :as quant]
             [h264.transform :as transform]
             [h264.intra-pred :as intra-pred]
@@ -168,12 +169,46 @@
           (vec (repeat 16 0))
           (map vector scan-order scanned)))
 
+(defn- dc-coeffs->per-block
+  "Entropy-method-agnostic (§8.5.10) post-processing shared by CAVLC's and
+   CABAC's Intra16x16 luma-DC decode: `coeffs` (16-elem SCAN-order vector,
+   RAW/not-yet-dequantized levels — the Hadamard transform below applies
+   its own qmul) -> unscan to raster -> luma DC Hadamard transform."
+  [coeffs qp]
+  (let [raster (unscan-raster zigzag coeffs)]
+    (transform/luma-dc-hadamard raster (quant/dc-qmul qp))))
+
+(defn- ac-coeffs->raster
+  "Entropy-method-agnostic (§8.5.9) post-processing shared by CAVLC's and
+   CABAC's AC-block decode: `coeffs` (15-elem SCAN-order vector, scan
+   positions 1..15) -> unscan to raster -> per-position dequant. Returns a
+   16-elem vector (position 0 always 0 — the caller overlays the DC value)."
+  [coeffs qp]
+  (let [ac-zigzag (subvec zigzag 1)
+        positions (unscan-raster ac-zigzag coeffs)]
+    (mapv (fn [pos]
+            (let [level (nth positions pos)]
+              ;; matches ffmpeg's `((int)(level*qmul+32))>>6` — MUST be an
+              ;; arithmetic (floor) shift, not truncating division, since
+              ;; level can be negative and the two differ whenever the
+              ;; numerator isn't an exact multiple of 64.
+              (if (zero? level) 0 (bit-shift-right (+ (* level (quant/ac-qmul qp (quot pos 4) (mod pos 4))) 32) 6))))
+          (range 16))))
+
 (defn- decode-luma-dc!
   [r nc qp]
-  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 16)
-        raster (unscan-raster zigzag coeffs)
-        dc-per-block (transform/luma-dc-hadamard raster (quant/dc-qmul qp))]
-    {:dc-per-block dc-per-block :total-coeff total-coeff}))
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 16)]
+    {:dc-per-block (dc-coeffs->per-block coeffs qp) :total-coeff total-coeff}))
+
+(defn- decode-luma-dc-cabac!
+  "CABAC counterpart of `decode-luma-dc!` — see `h264.cabac/residual-block!`
+   for the entropy decode, `dc-coeffs->per-block` for the shared dequant/
+   transform (identical to the CAVLC path once scan-order levels are known).
+   `nA`/`nB` are the already-derived `coded_block_flag` neighbor booleans
+   (§9.3.3.1.1.9 — see `h264.decode`'s CABAC macroblock decode)."
+  [eng ctxs nA nB qp]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs :luma-dc nA nB)]
+    {:dc-per-block (dc-coeffs->per-block coeffs qp) :total-coeff total-coeff}))
 
 (defn- decode-ac-block!
   "Decode one regular AC 4x4 block (scan positions 1..15, maxNumCoeff 15).
@@ -185,19 +220,16 @@
    levels, ready to overlay onto a block's coefficient array at positions
    1..15 (position 0 is the DC value, handled separately)."
   [r nc qp]
-  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 15)
-        ac-zigzag (subvec zigzag 1)
-        positions (unscan-raster ac-zigzag coeffs)]
-    {:ac-raster (mapv (fn [pos]
-                         (let [level (nth positions pos)]
-                           ;; matches ffmpeg's `((int)(level*qmul+32))>>6` —
-                           ;; MUST be an arithmetic (floor) shift, not
-                           ;; truncating division, since level can be
-                           ;; negative and the two differ whenever the
-                           ;; numerator isn't an exact multiple of 64.
-                           (if (zero? level) 0 (bit-shift-right (+ (* level (quant/ac-qmul qp (quot pos 4) (mod pos 4))) 32) 6))))
-                       (range 16))
-     :total-coeff total-coeff}))
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 15)]
+    {:ac-raster (ac-coeffs->raster coeffs qp) :total-coeff total-coeff}))
+
+(defn- decode-ac-block-cabac!
+  "CABAC counterpart of `decode-ac-block!` — `cat` is `:luma-ac` or
+   `:chroma-ac` (see `h264.cabac/residual-block!`); `nA`/`nB` are the
+   already-derived `coded_block_flag` neighbor booleans."
+  [eng ctxs cat nA nB qp]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs cat nA nB)]
+    {:ac-raster (ac-coeffs->raster coeffs qp) :total-coeff total-coeff}))
 
 (defn- decode-regular-block!
   "Decode one FULL 4x4 residual block (ALL 16 scan positions, maxNumCoeff
@@ -254,6 +286,16 @@
         dc-quad (transform/chroma-dc-hadamard coeffs (quant/dc-qmul qpc))]
     {:dc-quad dc-quad :total-coeff total-coeff}))
 
+(defn- decode-chroma-dc-cabac!
+  "CABAC counterpart of `decode-chroma-dc!`. `nA`/`nB` are the already-
+   derived per-COMPONENT (Cb or Cr — coded_block_flag context OFFSET is
+   shared between Cb/Cr, see `h264.cabac/cat-params`, but the neighbor
+   lookup is per-component) `coded_block_flag` neighbor booleans."
+  [eng ctxs nA nB qpc]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs :chroma-dc nA nB)
+        dc-quad (transform/chroma-dc-hadamard coeffs (quant/dc-qmul qpc))]
+    {:dc-quad dc-quad :total-coeff total-coeff}))
+
 (defn- clip8 [v] (max 0 (min 255 v)))
 
 (defn- decode-chroma-ac-blocks!
@@ -305,6 +347,40 @@
                         (when top-c (nth (:ac-nnz top-c) (chroma-col-row->blk [col 1]))))
                    nc (neighbor-nc nA nB)
                    {:keys [ac-raster total-coeff]} (decode-ac-block! r nc qpc)]
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-quad b))))
+           (range 4)))]
+    {:block-coeffs block-coeffs :ac-nnz @ac-nnz}))
+
+(defn- decode-chroma-ac-blocks-cabac!
+  "CABAC counterpart of `decode-chroma-ac-blocks!`. Unlike CAVLC's nC
+   (an average of neighbor total_coeff), CABAC's `coded_block_flag` neighbor
+   term is a plain boolean (`total_coeff > 0`), with a DIFFERENT
+   unavailable-neighbor default (`true`, since this repo's CABAC scope is
+   always-intra — see `h264.cabac/residual-block!`'s docstring and
+   `h264.decode`'s CABAC macroblock decode) — so this mirrors
+   `decode-chroma-ac-blocks!`'s cross-block-boundary neighbor-derivation
+   STRUCTURE exactly (same `chroma-blk->col-row`/`chroma-col-row->blk`
+   traversal) but cannot reuse `neighbor-nc` (CAVLC-specific nil-means-0
+   default)."
+  [eng ctxs qpc cbp-chroma dc-quad left-c top-c]
+  (let [ac-nnz (atom (vec (repeat 4 0)))
+        cbf-cache (atom (vec (repeat 4 false)))
+        block-coeffs
+        (if (< cbp-chroma 2)
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-quad b)))
+                (range 4))
+          (mapv
+           (fn [b]
+             (let [[col row] (chroma-blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @cbf-cache (chroma-col-row->blk [(dec col) row]))
+                        (if left-c (pos? (nth (:ac-nnz left-c) (chroma-col-row->blk [1 row]))) true))
+                   nB (if (pos? row)
+                        (nth @cbf-cache (chroma-col-row->blk [col (dec row)]))
+                        (if top-c (pos? (nth (:ac-nnz top-c) (chroma-col-row->blk [col 1]))) true))
+                   {:keys [ac-raster total-coeff]} (decode-ac-block-cabac! eng ctxs :chroma-ac nA nB qpc)]
+               (swap! cbf-cache assoc b (pos? total-coeff))
                (swap! ac-nnz assoc b total-coeff)
                (assoc ac-raster 0 (nth dc-quad b))))
            (range 4)))]
@@ -503,6 +579,150 @@
      :left-col (mapv #(nth % 15) recon)
      :cb cb
      :cr cr}))
+
+;; --- CABAC intra macroblock decode (ADR-2607122000 CABAC increment,
+;;     main/high-profile entropy coding — I-slice/Intra_16x16 ONLY, see
+;;     `h264.cabac`'s namespace docstring for exact scope). Mirrors
+;;     `decode-intra-macroblock-body!` structure exactly (same intra
+;;     prediction / inverse-transform / reconstruction calls — ONLY the
+;;     entropy decode + neighbor-derivation differ, since CABAC's
+;;     `coded_block_flag` neighbor term is a plain boolean with a DIFFERENT
+;;     unavailable-neighbor default than CAVLC's nC, see `h264.cabac`). ---
+
+(defn- decode-intra-macroblock-body-cabac!
+  "Decode one Intra_16x16 macroblock (luma + chroma) via CABAC from engine
+   `eng`/context vector `ctxs` (see `h264.cabac/init-engine!`/
+   `init-contexts`). `qp` is this MB's INCOMING QPy (running qp, same
+   convention as `decode-intra-macroblock-body!`); `last-dqp` is the
+   PREVIOUS macroblock's `mb_qp_delta` (slice-level running state,
+   §9.3.3.1.1.5's ctxIdxInc for `mb_qp_delta`'s own first bin — reset to 0
+   at slice start). `left-mb`/`top-mb`/`topleft-mb` are the SAME neighbor
+   MB-state shape `decode-intra-macroblock-body!` produces/consumes (this
+   repo's CABAC scope never mixes CAVLC/CABAC neighbors within one picture,
+   since entropy mode is a whole-PPS/whole-stream choice, but the STATE
+   SHAPE is intentionally identical so `add-residual-16x16`/
+   `reconstruct-chroma-plane`/plane assembly are shared unchanged).
+
+   Returns {:state (same shape `decode-intra-macroblock-body!` returns, plus
+   `:dc-nnz` on the `:cb`/`:cr` submaps for this fn's OWN chroma-DC
+   `coded_block_flag` neighbor derivation) :dqp (this MB's own mb_qp_delta,
+   for the NEXT macroblock's ctxIdxInc)}."
+  [eng ctxs qp last-dqp chroma-qp-index-offset left-mb top-mb topleft-mb]
+  (let [left-avail? (some? left-mb)
+        top-avail? (some? top-mb)
+        mb-type (cabac/read-mb-type-i! eng ctxs left-avail? top-avail?)
+        {:keys [pred-mode cbp-luma cbp-chroma]} (i16x16-mb-info mb-type)
+        cipr-nA (boolean (and left-mb (pos? (:intra-chroma-pred-mode left-mb)) (<= (:intra-chroma-pred-mode left-mb) 3)))
+        cipr-nB (boolean (and top-mb (pos? (:intra-chroma-pred-mode top-mb)) (<= (:intra-chroma-pred-mode top-mb) 3)))
+        intra-chroma-pred-mode (cabac/read-intra-chroma-pred-mode! eng ctxs cipr-nA cipr-nB)
+        dqp (cabac/read-mb-qp-delta! eng ctxs (not (zero? last-dqp)))
+        ;; §7.4.5 modulo-52 QP wrap — same as the CAVLC path, see that fn's
+        ;; own comment for why plain addition is wrong.
+        qp' (mod (+ qp dqp 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        dc-nA (if left-mb (pos? (:dc-nnz left-mb)) true)
+        dc-nB (if top-mb (pos? (:dc-nnz top-mb)) true)
+        dc-decoded (decode-luma-dc-cabac! eng ctxs dc-nA dc-nB qp')
+        dc-per-block (:dc-per-block dc-decoded)
+        dc-total-coeff (:total-coeff dc-decoded)
+        ac-nnz (atom (vec (repeat 16 0)))
+        cbf-cache (atom (vec (repeat 16 false)))
+        block-coeffs
+        (if (zero? cbp-luma)
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-per-block b))) (range 16))
+          (mapv
+           (fn [b]
+             (let [[col row] (blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @cbf-cache (col-row->blk [(dec col) row]))
+                        (if left-mb (pos? (nth (:ac-nnz left-mb) (col-row->blk [3 row]))) true))
+                   nB (if (pos? row)
+                        (nth @cbf-cache (col-row->blk [col (dec row)]))
+                        (if top-mb (pos? (nth (:ac-nnz top-mb) (col-row->blk [col 3]))) true))
+                   {:keys [ac-raster total-coeff]} (decode-ac-block-cabac! eng ctxs :luma-ac nA nB qp')]
+               (swap! cbf-cache assoc b (pos? total-coeff))
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-per-block b))))
+           (range 16)))
+        top-row (:top-row top-mb)
+        left-col (:left-col left-mb)
+        pred-16x16 (intra-pred/predict-16x16 pred-mode
+                                              {:top-available? (some? top-mb)
+                                               :left-available? (some? left-mb)
+                                               :top-row top-row
+                                               :left-col left-col})
+        recon (add-residual-16x16 pred-16x16 block-coeffs)
+        cb-dc-nA (if left-mb (pos? (get-in left-mb [:cb :dc-nnz] 0)) true)
+        cb-dc-nB (if top-mb (pos? (get-in top-mb [:cb :dc-nnz] 0)) true)
+        cr-dc-nA (if left-mb (pos? (get-in left-mb [:cr :dc-nnz] 0)) true)
+        cr-dc-nB (if top-mb (pos? (get-in top-mb [:cr :dc-nnz] 0)) true)
+        cb-dc-decoded (when (pos? cbp-chroma) (decode-chroma-dc-cabac! eng ctxs cb-dc-nA cb-dc-nB qpc))
+        cr-dc-decoded (when (pos? cbp-chroma) (decode-chroma-dc-cabac! eng ctxs cr-dc-nA cr-dc-nB qpc))
+        cb-dc-quad (if cb-dc-decoded (:dc-quad cb-dc-decoded) [0 0 0 0])
+        cr-dc-quad (if cr-dc-decoded (:dc-quad cr-dc-decoded) [0 0 0 0])
+        cb-dc-total (if cb-dc-decoded (:total-coeff cb-dc-decoded) 0)
+        cr-dc-total (if cr-dc-decoded (:total-coeff cr-dc-decoded) 0)
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks-cabac! eng ctxs qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks-cabac! eng ctxs qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-corner (get-in topleft-mb [:cb :recon 7 7])
+        cr-corner (get-in topleft-mb [:cr :recon 7 7])
+        cb-recon (reconstruct-chroma-plane cb-block-coeffs intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr-recon (reconstruct-chroma-plane cr-block-coeffs intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)
+        cb (assoc cb-recon :ac-nnz cb-ac-nnz :dc-nnz cb-dc-total)
+        cr (assoc cr-recon :ac-nnz cr-ac-nnz :dc-nnz cr-dc-total)]
+    {:state {:recon recon
+             :qp qp'
+             :pred-mode pred-mode
+             :intra-chroma-pred-mode intra-chroma-pred-mode
+             :dc-nnz dc-total-coeff
+             :ac-nnz @ac-nnz
+             :inter? false
+             :mv nil
+             :top-row (nth recon 15)
+             :left-col (mapv #(nth % 15) recon)
+             :cb cb
+             :cr cr}
+     :dqp dqp}))
+
+(defn- decode-i-slice-mbs-cabac!
+  "Decode all macroblocks of a single CABAC I-slice covering the whole
+   picture (§7.3.4 `slice_data()`'s `entropy_coding_mode_flag` branch,
+   specialized to this repo's single-slice-per-picture / I-slice-only CABAC
+   scope). Byte-aligns `r` (`cabac_alignment_one_bit`) and initializes the
+   arithmetic engine + context models (from SliceQPY, §9.3.1.1.1) ONCE for
+   the whole slice, then decodes macroblocks in raster order, each followed
+   by a `decode_terminate!` (`end_of_slice_flag`) — REQUIRED after every
+   macroblock regardless of this repo's own `num-mb` bookkeeping, since
+   DecodeTerminate mutates the engine's `codIRange`/`codIOffset` (§9.3.3.2.4)
+   and skipping it would desync the NEXT macroblock's first bin. Asserts
+   (throws) that `end_of_slice_flag` fires EXACTLY at the picture's last
+   macroblock, not before or after — a real bitstream/implementation bug
+   would otherwise silently produce a truncated or overrun picture."
+  [r slice-qp chroma-qp-index-offset mb-width mb-height]
+  (cabac/byte-align! r)
+  (let [eng (cabac/init-engine! r)
+        ctxs (cabac/init-contexts slice-qp)
+        num-mb (* mb-width mb-height)]
+    (loop [addr 0 qp slice-qp last-dqp 0 states []]
+      (if (= addr num-mb)
+        states
+        (let [mb-x (mod addr mb-width)
+              mb-y (quot addr mb-width)
+              left-mb (when (pos? mb-x) (nth states (dec addr)))
+              top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+              topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+              {:keys [state dqp]} (decode-intra-macroblock-body-cabac! eng ctxs qp last-dqp chroma-qp-index-offset left-mb top-mb topleft-mb)
+              eos (cabac/decode-terminate! eng)
+              next-addr (inc addr)]
+          (when (and (= eos 1) (not= next-addr num-mb))
+            (throw (ex-info "h264.decode: CABAC end_of_slice_flag fired before the picture's macroblock count was reached (desync?)"
+                             {:addr addr :num-mb num-mb})))
+          (when (and (zero? eos) (= next-addr num-mb))
+            (throw (ex-info "h264.decode: CABAC end_of_slice_flag did not fire at the picture's last macroblock (desync?)"
+                             {:addr addr :num-mb num-mb})))
+          (recur next-addr (:qp state) dqp (conj states state)))))))
 
 (defn- decode-macroblock!
   "I-slice entry point: read `mb_type` directly (I-slice numbering, 1..24
@@ -780,21 +1000,28 @@
         _ (when-not (zero? (:first-mb-in-slice header))
             (throw (ex-info "h264.decode: only a single slice covering the whole picture (first_mb_in_slice=0) is supported"
                              {:first-mb-in-slice (:first-mb-in-slice header)})))
+        entropy-mode (:entropy-coding-mode pps-map)
+        _ (when (and (= entropy-mode :cabac) (not= slice-class :i))
+            (throw (ex-info "h264.decode: CABAC is only supported for I-slices in this repo's scope (CABAC + P-slice/inter is out of scope, see h264.cabac)"
+                             {:slice-type (:slice-type header) :slice-type-class slice-class})))
         num-mb (* mb-width mb-height)
         chroma-qp-index-offset (:chroma-qp-index-offset pps-map)
         mb-states
-        (case slice-class
-          :i (loop [addr 0 qp (:slice-qp header) states []]
-               (if (= addr num-mb)
-                 states
-                 (let [mb-x (mod addr mb-width)
-                       mb-y (quot addr mb-width)
-                       left-mb (when (pos? mb-x) (nth states (dec addr)))
-                       top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
-                       topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
-                       state (decode-macroblock! r qp chroma-qp-index-offset left-mb top-mb topleft-mb)]
-                   (recur (inc addr) (:qp state) (conj states state)))))
-          :p (decode-p-slice-mbs! r (:slice-qp header) chroma-qp-index-offset mb-width mb-height ref-frame))
+        (case entropy-mode
+          :cabac (decode-i-slice-mbs-cabac! r (:slice-qp header) chroma-qp-index-offset mb-width mb-height)
+          :cavlc
+          (case slice-class
+            :i (loop [addr 0 qp (:slice-qp header) states []]
+                 (if (= addr num-mb)
+                   states
+                   (let [mb-x (mod addr mb-width)
+                         mb-y (quot addr mb-width)
+                         left-mb (when (pos? mb-x) (nth states (dec addr)))
+                         top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+                         topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+                         state (decode-macroblock! r qp chroma-qp-index-offset left-mb top-mb topleft-mb)]
+                     (recur (inc addr) (:qp state) (conj states state)))))
+            :p (decode-p-slice-mbs! r (:slice-qp header) chroma-qp-index-offset mb-width mb-height ref-frame)))
         w (:width sps-map) h (:height sps-map)
         cw (quot w 2) ch (quot h 2)
         assemble (fn [blk-size plane-w plane-h recon-fn]

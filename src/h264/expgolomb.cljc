@@ -38,6 +38,13 @@
 
 (defn flag! [r] (bit! r))
 
+(defn byte-aligned?
+  "True iff `r` is currently positioned at a byte boundary (bitpos 0) —
+   H.264 §7.2's `byte_aligned()`, needed by CABAC's `slice_data()`
+   `cabac_alignment_one_bit` (see `h264.cabac/byte-align!`)."
+  [r]
+  (zero? @(:bitpos r)))
+
 ;; --- encode side (Wave 2 addition, kotoba-lang/root ADR-2607121400) ---
 ;; Bit writer mirroring `reader`/`bit!`/`bits!` above: accumulates bits
 ;; MSB-first into whole bytes. `bytes!` finalizes (flushes a partial byte,

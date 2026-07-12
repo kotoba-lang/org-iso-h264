@@ -33,11 +33,16 @@ compensation" below), and — most recently — the **P-slice inter ENCODE
 counterpart** (`h264.encode/encode-gop`, Migration step 7's encode
 increment: integer-pel full-search + quarter-pel local-refinement motion
 estimation, P_Skip mode decision, P_L0_16x16 CAVLC-coded residual — see
-"Pixel encode: P-slice (inter)" below). The original framing-only boundary
-still holds for **CABAC**, multi-reference/B-slice inter prediction, and
-sub-partitioned motion (`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`,
-both decode and encode) — those remain out of scope (see below for exactly
-what is/isn't covered).
+"Pixel encode: P-slice (inter)" below), and — most recently — a first
+**CABAC (main/high-profile entropy coding) decode** increment
+(`h264.cabac`, I-slice/Intra_16x16/single-macroblock scope so far — see
+"Pixel decode: CABAC" below for exactly what's validated and a known,
+not-yet-root-caused multi-macroblock limitation). The original
+framing-only boundary still holds for CABAC + P-slice/inter prediction,
+multi-reference/B-slice inter prediction, sub-partitioned motion
+(`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`, both decode and
+encode), and CABAC encode — those remain out of scope (see below for
+exactly what is/isn't covered).
 
 ## Namespaces
 
@@ -57,6 +62,7 @@ what is/isn't covered).
 | `h264.quant` | (also) `chroma-qp`: QPc derivation from QPy + PPS `chroma_qp_index_offset` (§8.5.8 Table 8-15) — reused unchanged by `h264.encode`'s chroma path (intra AND inter) |
 | `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. `decode-idr-frame` (single IDR picture, unchanged public API) AND `decode-gop` (a whole IDR+P sequence, new). See "Pixel decode" and "Pixel decode: P-slice (inter)" below for exact scope |
 | `h264.interp` | decode: luma quarter-sample (§8.4.2.2.1, 6-tap FIR + averaging) and chroma eighth-sample (§8.4.2.2.2, bilinear) sub-pel motion-compensated interpolation over a picture-boundary-extended plane. Pure functions, no bitstream dependency. `h264.decode/mc-predict` is the decode-side caller; `h264.encode/mc-predict` (a small deliberate duplication, same convention as that namespace's `neighbor-nc`) calls the SAME `h264.interp` functions on the encode side, both for motion-compensated prediction AND to SCORE candidate motion vectors during motion estimation. See "Sub-pel motion compensation" below |
+| `h264.cabac` | decode: CABAC (Context-Adaptive Binary Arithmetic Coding, §9.3) entropy decode for main/high-profile streams — the literal per-bit arithmetic decoding engine (§9.3.3.2: `decode-decision!`/`decode-bypass!`/`decode-terminate!`, `range-tab-lps`/`trans-idx-lps`/`trans-idx-mps` per Tables 9-44/9-45), context-model initialization from SliceQPY (§9.3.1.1.1, I-slice-only `context-init-i` table, Tables 9-12..9-24), `mb_type`/`intra_chroma_pred_mode`/`mb_qp_delta` binarization, and `residual-block!` (`coded_block_flag`/`significant_coeff_flag`/`last_significant_coeff_flag`/`coeff_abs_level_minus1` combined, returning the SAME scan-order `{:coeffs :total-coeff}` shape `h264.cavlc/residual-block!` does so `h264.decode` shares its dequant/transform pipeline unchanged regardless of entropy method). **I-slice/Intra_16x16 ONLY** — see "Pixel decode: CABAC" below for exact scope and a known, not-yet-root-caused limitation (multi-macroblock pictures / residual blocks with 3+ significant coefficients) |
 
 ## Validation
 
@@ -176,12 +182,16 @@ golden model for a future capability-gated *native* realtime decoder
   `chroma_format_idc` other than 1 throws.
 
 **What's explicitly NOT implemented** (out of scope, not silently wrong):
-CABAC, P/B slices and all inter prediction/motion compensation, multiple
+P/B slices and all inter prediction/motion compensation, multiple
 reference frames, ChromaArrayType 0/2/3 (monochrome/4:2:2/4:4:4), the
 deblocking loop filter, `I_NxN`/`I_PCM` macroblock types, Plane *luma*
 intra prediction (Plane *chroma* IS implemented, see above), frame
 cropping (picture width/height must be exact multiples of 16), and
-multi-picture streams (only the first IDR slice is decoded).
+multi-picture streams (only the first IDR slice is decoded). CABAC
+(main/high-profile entropy coding) was originally out of scope here too —
+**this is no longer entirely true as of the CABAC increment below**, which
+adds real (if currently narrower-than-CAVLC) CABAC decode support; see
+"Pixel decode: CABAC" for exactly what's covered.
 
 **Golden-vector validation is real but narrow — read this before trusting
 a number beyond it.** `test/h264/decode_test.clj` validates against real
@@ -326,6 +336,133 @@ i.e. right-shaped, wrong-valued) output:**
   (`CodedBlockPatternChroma == 2`) — DC-only fixtures don't exercise this
   order at all, so this only surfaces with real multi-component AC
   content. See `h264.decode/decode-chroma-ac-blocks!`'s docstring.
+
+## Pixel decode: CABAC (Wave 8, ADR-2607122000 CABAC increment)
+
+`h264.cabac`, wired into `h264.decode`, adds real CABAC (Context-Adaptive
+Binary Arithmetic Coding, §9.3) entropy decode for main/high-profile
+streams — the first time this ecosystem decodes anything other than
+baseline-profile CAVLC. Same non-realtime, correctness-first reference
+tier as every other decode path here.
+
+**What's implemented:**
+- **The literal per-bit arithmetic decoding engine** (§9.3.3.2 — NOT
+  FFmpeg's own byte-buffered/table-packed variant, see `h264.cabac`'s
+  namespace docstring for why): `codIRange`/`codIOffset` init and
+  renormalization, `DecodeDecision`/`DecodeBypass`/`DecodeTerminate`.
+  `range-tab-lps`/`trans-idx-lps`/`trans-idx-mps` (Tables 9-44/9-45) and
+  the I-slice column of the context-init `(m,n)` table (Tables 9-12..9-24,
+  `context-init-i`, 460 entries) were extracted PROGRAMMATICALLY (a small
+  parser, not hand-transcribed) from Cisco OpenH264's
+  `codec/common/src/common_tables.cpp` — chosen over FFmpeg's own
+  `ff_h264_cabac_tables` specifically because OpenH264's is a literal,
+  un-packed transcription (separate `pStateIdx`/`valMPS`) matching this
+  namespace's own engine design, and cross-checked against FFmpeg's
+  independently-packed encoding of the SAME tables (both agree exactly:
+  pStateIdx 0 → rangeTabLPS `{128,176,208,240}`/transIdxLPS 0/transIdxMPS 1,
+  pStateIdx 63 → `{2,2,2,2}`/63/63 — the well-known published values).
+- **`mb_type` (I-slice), `intra_chroma_pred_mode`, `mb_qp_delta`
+  binarization** (§9.3.2.2/9.3.2.5/9.3.2.7), each cross-referenced against
+  OpenH264's own `ParseMBTypeISliceCabac`/`ParseIntraPredModeChromaCabac`/
+  `ParseDeltaQpCabac` (`codec/decoder/core/src/parse_mb_syn_cabac.cpp`) —
+  not re-derived from spec prose alone.
+- **`residual-block!`**: `coded_block_flag` (§9.3.3.1.1.9 — unlike CAVLC's
+  `coeff_token`, CABAC always spends an explicit bit per potentially-empty
+  block; the unavailable-neighbor default is "1 if the CURRENT macroblock
+  is intra" — always true in this repo's always-intra CABAC scope, a
+  genuinely different rule than CAVLC's nC "unavailable → 0" default),
+  `significant_coeff_flag`/`last_significant_coeff_flag` (§9.3.3.1.2, a
+  pure scan-position-indexed context — no neighbor dependence, unlike
+  CAVLC's nC), and `coeff_abs_level_minus1` + its bypass sign bit
+  (§9.3.2.3/9.3.3.1.3 — the adaptive `c1`/`c2` context-index state machine,
+  including the truncated-unary-then-EG0-bypass-suffix continuation for
+  `coeff_abs_level_minus1`, ported from OpenH264's `DecodeUEGLevelCabac`/
+  `DecodeExpBypassCabac` rather than re-derived). Returns the SAME
+  scan-order `{:coeffs :total-coeff}` shape `h264.cavlc/residual-block!`
+  does, so `h264.decode` reuses the EXACT SAME entropy-agnostic
+  unscan/dequant/(luma-DC-Hadamard or regular-4x4) transform pipeline for
+  both entropy methods — only the entropy-decode call and the
+  neighbor-derivation rule for context selection differ between
+  `decode-luma-dc!`/`decode-ac-block!` (CAVLC) and
+  `decode-luma-dc-cabac!`/`decode-ac-block-cabac!` (CABAC).
+- **`coded_block_pattern` is NOT separately read for Intra_16x16
+  macroblocks** (CABAC OR CAVLC) — it's fully inferred from `mb_type`
+  itself (Table 7-11, `h264.decode/i16x16-mb-info`, unchanged), matching
+  §7.3.5.1's own `mb_qp_delta`/`residual()` presence condition (which
+  explicitly includes `MbPartPredMode==Intra_16x16` as an alternative to
+  `CodedBlockPatternLuma>0`). This means `h264.cabac`'s own
+  `coded_block_pattern` context model (ctxIdxOffset 73) is simply unused —
+  it's only needed for I_NxN/inter mb_types, both out of this repo's scope.
+
+**What's explicitly NOT implemented / not yet working** (out of scope, or
+a known limitation — see below for exactly which):
+- CABAC + P-slice/inter prediction (unchanged from every CAVLC-side scope
+  note — `h264.decode` throws if a CABAC-flagged PPS is combined with a
+  P-slice).
+- CABAC + `I_NxN`/`I_8x8`/`I_PCM` (same throw-on-unsupported-`mb_type`
+  discipline as CAVLC, via the shared `i16x16-mb-info`).
+- `transform_size_8x8_flag`/8x8-transform CABAC contexts (High-Profile-only
+  — this repo's `h264.pps` doesn't even parse the field, see that
+  namespace's docstring).
+- CABAC ENCODE (this increment is decode-only, mirroring how CAVLC decode
+  long preceded CAVLC encode in this repo's own history).
+
+**Known limitation, NOT yet root-caused (read before trusting a CABAC
+result beyond the validated fixtures below).** `test/h264/decode_cabac_test.clj`
+validates 2 real `ffmpeg 8.1.1`/x264-encoded Main-profile fixtures
+bit-exact (no tolerance): `flat16-dc-only-cabac.h264` (single macroblock,
+`coded_block_flag`=0 fast path for every block) and
+`gradient16-ac-cabac.h264` (single macroblock, ONE genuinely significant
+AC coefficient — the first real exercise of
+`significant_coeff_flag`/`coeff_abs_level_minus1`). Both required
+`--no-deblock` for the latter (a real libx264 in-loop deblocking effect
+this decoder — CABAC or CAVLC alike — doesn't implement, same limitation
+as the existing CAVLC `horizontal-multimb64.h264` fixture; confirmed to be
+a deblocking difference and NOT a CABAC bug by manually verifying the
+pre-deblock reconstruction from this decoder's own coefficients, fed
+through the already-tested `h264.transform` pipeline, matched ffmpeg's
+output only once deblocking was disabled).
+
+**Beyond these two single-macroblock, ≤1-significant-coefficient-per-block
+fixtures, this decoder is NOT yet confirmed bit-exact.** A real
+multi-macroblock CABAC fixture (64x64/16 macroblocks, same recipe as
+`horizontal-multimb64.h264` but Main profile) decodes with fully correct
+high-level structure — `mb_type`/inferred `coded_block_pattern`/
+Intra_16x16 prediction-mode decisions were independently verified to
+EXACTLY match an independently-CAVLC-encoded version of the identical
+source image (same real encoder, same content, different entropy mode),
+and the bitstream framing is internally consistent (`end_of_slice_flag`
+fires at precisely the picture's last macroblock, no early/late
+termination) — but the RECONSTRUCTED PIXELS show small (typically ±1..3,
+occasionally more) discrepancies specifically in 4x4 residual blocks whose
+`coded_block_flag`=1 decode finds 3 OR MORE significant coefficients (a
+real multi-macroblock all-flat-luma/oscillating-chroma fixture, analogous
+to `chroma-multimb32.h264`, shows the SAME pattern in chroma once real
+multi-coefficient chroma AC blocks are involved, ruling out a luma-specific
+cause). The arithmetic-decoding-engine control flow and the `c1`/`c2`
+adaptive context-index state machine for MULTIPLE significant coefficients
+per block (including the reset-to-0 rule after any `coeff_abs_level>1`
+event, and the EG0-bypass-suffix fallback for large magnitudes) were
+independently verified correct via scripted-bit unit tests of
+`h264.cabac/read-coeff-levels!`/`decode-ueg-level!`/
+`decode-exp-golomb-bypass!` in isolation (feeding hand-constructed bin
+sequences and checking the decoded value/context-index sequence against a
+hand-worked expectation) — so the bug, if it is a decode bug at all rather
+than something specific to how these particular real encoder bitstreams
+happen to be constructed, is narrowly scoped to either the real arithmetic
+engine's behavior under longer/more-varied real bit sequences (as opposed
+to the scripted true/false stand-ins the unit tests use in place of the
+real engine) or a context-table transcription error at a specific `c1`/`c2`
+combination not yet spot-checked. **Next step for whoever picks this up:**
+obtain a verbose per-bin CABAC reference trace for one of these
+multi-macroblock fixtures (e.g. the JM reference software's verbose trace
+mode, or a custom-instrumented ffmpeg/OpenH264 debug build) and diff it
+directly against this namespace's own bin sequence — the investigation so
+far has ruled out the shared dequant/transform pipeline (already proven
+correct for even LARGER-magnitude coefficients via the existing, passing
+CAVLC `horizontal-multimb64.h264` fixture), the QP derivation (shared,
+unmodified code path), and the binarization control-flow logic in
+isolation, which narrows the remaining search space considerably.
 
 ## Pixel decode: P-slice (inter) (Wave 6, ADR-2607122000 Migration step 7's first increment)
 
