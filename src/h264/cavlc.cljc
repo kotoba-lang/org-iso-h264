@@ -303,3 +303,206 @@
                        (let [coeff-num' (+ coeff-num (nth run-vals i) 1)]
                          (recur (dec i) coeff-num' (assoc acc coeff-num' (nth levels i))))))]
         {:coeffs coeffs :total-coeff total-coeff}))))
+
+;; --- encode side (ADR-2607122000 Migration step 8) ---
+;;
+;; Writes the SAME syntax `residual-block!` reads, reusing its VLC tables
+;; as reverse-lookup tables (linear scan for the matching [len,bits] row —
+;; simple and correct; performance doesn't matter for this non-realtime
+;; reference encoder). The trickiest part is `encode-level!`, the exact
+;; mechanical inverse of `residual-block!`'s level_prefix/level_suffix/
+;; level_code state machine (suffix_length escalation) — derived by tracing
+;; that decode loop step-by-step (not from a separately memorized spec
+;; description) and verified via `cavlc_test.clj`'s round-trip tests
+;; (encode then decode with THIS SAME repo's `residual-block!`, covering
+;; trailing-ones, escape-range levels, and the suffix_length escalation
+;; path).
+
+(defn- write-unary-prefix!
+  "Write `n` zero bits then a terminating 1 bit — the exact inverse of the
+   `(loop [lz 0] (if (zero? (eg/bit! r)) (recur (inc lz)) lz))` leading-zero
+   count read used throughout this ns (level_prefix here, and implicitly by
+   `decode-flatlist-vlc!`'s underlying bit reads elsewhere)."
+  [w n]
+  (dotimes [_ n] (eg/write-bit! w 0))
+  (eg/write-bit! w 1))
+
+(defn- find-flat-vlc-code
+  "Reverse-lookup: the [len bits] entry at `idx` in parallel `lens`/`bits`
+   vectors — the exact inverse of `decode-flatlist-vlc!`'s linear search
+   (that fn finds `idx` given a bit-matched len/code; this does the
+   opposite: given `idx`, returns the code to write)."
+  [lens bits idx]
+  [(nth lens idx) (nth bits idx)])
+
+(defn- encode-coeff-token!
+  "Write coeff_token for a regular (luma or chroma AC) block, given `nc`
+   (same neighbor-derived value the decode side would compute) and
+   `total-coeff`/`trailing-ones`. Reverse lookup into `coeff-token-len`/
+   `-bits` for the nC class — exact inverse of `decode-coeff-token!`."
+  [w nc total-coeff trailing-ones]
+  (let [class (nc-class nc)
+        idx (+ (* total-coeff 4) trailing-ones)
+        [len bits] (find-flat-vlc-code (nth coeff-token-len class) (nth coeff-token-bits class) idx)]
+    (eg/write-bits! w len bits)))
+
+(defn- encode-chroma-dc-coeff-token!
+  "Write coeff_token for the ChromaArrayType 1 (4:2:0) chroma DC block
+   (nC==-1 special case) — exact inverse of `decode-chroma-dc-coeff-token!`."
+  [w total-coeff trailing-ones]
+  (let [idx (+ (* total-coeff 4) trailing-ones)
+        [len bits] (find-flat-vlc-code chroma-dc-coeff-token-len chroma-dc-coeff-token-bits idx)]
+    (eg/write-bits! w len bits)))
+
+(defn- encode-total-zeros!
+  [w nc total-coeff total-zeros]
+  (let [[lens bits] (if (= nc :chroma-dc)
+                       [(nth chroma-dc-total-zeros-len (dec total-coeff))
+                        (nth chroma-dc-total-zeros-bits (dec total-coeff))]
+                       [(nth total-zeros-len (dec total-coeff))
+                        (nth total-zeros-bits (dec total-coeff))])
+        [len code] (find-flat-vlc-code lens bits total-zeros)]
+    (eg/write-bits! w len code)))
+
+(defn- encode-run-before!
+  [w zeros-left run]
+  (let [zl-idx (min (dec zeros-left) 6)
+        [len code] (find-flat-vlc-code (nth run-len zl-idx) (nth run-bits zl-idx) run)]
+    (eg/write-bits! w len code)))
+
+(defn- level-code->prefix-suffix
+  "Given a target `level-code` (already inverse-mapped from the signed
+   level per `level-code<->v` below) and the CURRENT `suffix-length` state,
+   returns `[level-prefix level-suffix level-suffix-size]` — the exact
+   mechanical inverse of `residual-block!`'s
+   `level-code (+ (bit-shift-left (min 15 level-prefix) suffix-length) level-suffix)`
+   (plus its `>=15`/`>=16` escape-range adjustments), derived by case
+   analysis on that decode formula rather than a separately memorized
+   description."
+  [level-code suffix-length]
+  (cond
+    ;; suffix-length = 0, level-prefix < 14: level-code = level-prefix directly (no suffix bits)
+    (and (zero? suffix-length) (< level-code 14))
+    [level-code 0 0]
+
+    ;; suffix-length = 0, level-prefix == 14 special case (level-suffix-size forced to 4
+    ;; even though suffix-length is 0): level-code = 14 + level-suffix, level-suffix in 0..15
+    (and (zero? suffix-length) (< level-code 30))
+    [14 (- level-code 14) 4]
+
+    ;; suffix-length = 0, escape range (level-prefix >= 15): level-code = 15 + level-suffix
+    ;; (the ">=15 && suffix-length==0" "+15" adjustment), level-suffix-size = level-prefix-3
+    (zero? suffix-length)
+    (let [suffix-val (- level-code 30)
+          prefix (loop [p 15] (if (< suffix-val (bit-shift-left 1 (- p 3))) p (recur (inc p))))]
+      [prefix suffix-val (- prefix 3)])
+
+    :else
+    ;; suffix-length > 0 (normal case): level-prefix = level-code >> suffix-length (if < 15)
+    (let [prefix-guess (bit-shift-right level-code suffix-length)]
+      (if (< prefix-guess 15)
+        [prefix-guess (bit-and level-code (dec (bit-shift-left 1 suffix-length))) suffix-length]
+        ;; escape (level-prefix >= 15): level-code = (15<<suffix-length) + level-suffix
+        (let [over (- level-code (bit-shift-left 15 suffix-length))
+              prefix (loop [p 15] (if (< over (bit-shift-left 1 (- p 3))) p (recur (inc p))))]
+          [prefix over (- prefix 3)])))))
+
+(defn- v->level-code
+  "Signed level `v` → `level-code`, the exact inverse of `residual-block!`'s
+   `v = if (even? level-code) (quot (+ level-code 2) 2) (quot (- (- level-code) 1) 2))`."
+  [v]
+  (if (pos? v) (- (* 2 v) 2) (- (* -2 v) 1)))
+
+(defn- encode-level!
+  "Write one level_prefix/level_suffix for signed level `v` (a non-trailing-
+   one level, i.e. `i >= trailing-ones` in `residual-block!`'s loop) at
+   read-order index `i`, given the running `suffix-length` state and
+   `trailing-ones`. Returns the UPDATED suffix-length (mirrors
+   `residual-block!`'s `suffix-length''` computation exactly, so callers can
+   thread it through the same way decode does). Handles the `i ==
+   trailing-ones && trailing-ones < 3` \"+2\" adjustment (undone before
+   deriving prefix/suffix) — this repo's encoder never produces `abs(v)=1`
+   at that position (that would have made it a 4th trailing-one instead, an
+   invariant enforced by `h264.encode`'s CAVLC-shaping)."
+  [w v i trailing-ones suffix-length]
+  (let [level-code (v->level-code v)
+        level-code (if (and (= i trailing-ones) (< trailing-ones 3)) (- level-code 2) level-code)
+        _ (when (neg? level-code)
+            (throw (ex-info "h264.cavlc/encode-level!: level-code went negative after removing the trailing-ones +2 adjustment — caller produced abs(v)=1 right after a <3 run of trailing ones, which decode would have read as a 4th trailing one instead"
+                             {:v v :i i :trailing-ones trailing-ones})))
+        [level-prefix level-suffix level-suffix-size] (level-code->prefix-suffix level-code suffix-length)]
+    (write-unary-prefix! w level-prefix)
+    (when (pos? level-suffix-size) (eg/write-bits! w level-suffix-size level-suffix))
+    (let [suffix-length' (if (zero? suffix-length) 1 suffix-length)
+          abs-v (if (neg? v) (- v) v)]
+      (if (and (> abs-v (bit-shift-left 3 (dec suffix-length'))) (< suffix-length' 6))
+        (inc suffix-length')
+        suffix-length'))))
+
+(defn encode-residual-block!
+  "Write one CAVLC residual_block for `coeffs` (a `max-num-coeff`-length
+   SCAN-ORDER vector, same shape `residual-block!` returns as `:coeffs` —
+   i.e. the caller has already zigzag-SCANNED a raster coefficient array).
+   `nc` is the coeff_token VLC class selector (a real neighbor-derived nC,
+   OR `:chroma-dc` for the ChromaArrayType 1 chroma-DC nC==-1 special
+   case) — MUST be derived by the caller using the exact same neighbor
+   logic `h264.decode` uses, or the encoded stream will decode to the wrong
+   values even though it's syntactically well-formed.
+
+   Returns `total-coeff` (the same value decode's `residual-block!` would
+   report — feeds this block's own neighbor-nC contribution for MBs to the
+   right/below, mirroring `h264.decode`'s bookkeeping)."
+  [w nc max-num-coeff coeffs]
+  (let [nonzero (vec (keep-indexed (fn [pos v] (when-not (zero? v) [pos v])) coeffs))
+        total-coeff (count nonzero)]
+    (if (zero? total-coeff)
+      (do (if (= nc :chroma-dc)
+            (encode-chroma-dc-coeff-token! w 0 0)
+            (encode-coeff-token! w nc 0 0))
+          0)
+      (let [;; trailing-ones: consecutive |v|=1 entries at the HIGH end (last
+            ;; in scan order = highest scan position), capped at 3
+            trailing-ones (loop [k 0]
+                             (if (>= k (min 3 total-coeff))
+                               k
+                               (let [[_ v] (nth nonzero (- total-coeff 1 k))]
+                                 (if (= 1 (if (neg? v) (- v) v)) (recur (inc k)) k))))
+            ;; levels[i] for i=0..total-coeff-1, i=0 = HIGHEST scan-position
+            ;; value (read first in bitstream), i=total-coeff-1 = LOWEST
+            ;; scan-position value (read last) -- see cavlc.cljc encode-side
+            ;; docstring / decode trace.
+            levels (mapv (fn [i] (nth nonzero (- total-coeff 1 i))) (range total-coeff))
+            positions (mapv first levels)
+            values (mapv second levels)
+            ;; positions[0] = highest (P[k]) nonzero scan position; total
+            ;; zeros preceding it (spec's total_zeros) = P[k]+1-total_coeff.
+            zeros-left (- (first positions) (dec total-coeff))]
+        (when (= nc :chroma-dc)
+          (encode-chroma-dc-coeff-token! w total-coeff trailing-ones))
+        (when-not (= nc :chroma-dc)
+          (encode-coeff-token! w nc total-coeff trailing-ones))
+        ;; levels (signs for trailing ones, full level_prefix/suffix otherwise)
+        (loop [i 0 suffix-length (if (and (> total-coeff 10) (< trailing-ones 3)) 1 0)]
+          (when (< i total-coeff)
+            (let [v (nth values i)]
+              (if (< i trailing-ones)
+                (do (eg/write-bit! w (if (pos? v) 0 1))
+                    (recur (inc i) suffix-length))
+                (let [suffix-length' (encode-level! w v i trailing-ones suffix-length)]
+                  (recur (inc i) suffix-length'))))))
+        ;; total_zeros (only if fewer nonzero than max — matches decode)
+        (when (< total-coeff max-num-coeff)
+          (encode-total-zeros! w nc total-coeff zeros-left))
+        ;; run_before, for i=0..total-coeff-2 (matches decode: last one is
+        ;; inferred as whatever zeros remain, no bits written). run_vals[i]
+        ;; = positions[i] - positions[i+1] - 1 (the zero-gap between the
+        ;; i-th and (i+1)-th read coefficient, in bitstream/high-to-low
+        ;; scan-position read order — see positions' construction above).
+        (loop [i 0 zl zeros-left]
+          (when (< i (dec total-coeff))
+            (if (pos? zl)
+              (let [run (- (nth positions i) (nth positions (inc i)) 1)]
+                (encode-run-before! w zl run)
+                (recur (inc i) (- zl run)))
+              (recur (inc i) zl))))
+        total-coeff))))

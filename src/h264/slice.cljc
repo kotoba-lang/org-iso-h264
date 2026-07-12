@@ -65,3 +65,56 @@
      :idr-pic-id idr-pic-id
      :slice-qp-delta slice-qp-delta
      :slice-qp (+ pic-init-qp slice-qp-delta)}))
+
+;; --- encode side (ADR-2607122000 Migration step 8) ---
+
+(defn encode-header!
+  "Write a slice_header (§7.3.3) to `w` (an `h264.expgolomb` WRITER, NOT
+   the reader `parse-header!` uses — this repo's encode path builds the
+   whole slice NAL, including the macroblock data that follows, into a
+   single writer, mirroring `parse-header!`'s \"continue with the same
+   reader\" design but for writing). Scope: single-slice-per-picture IDR
+   I-slice only (mirrors `parse-header!`'s own decode scope, and
+   `h264.encode`'s encoder scope) — `slice-type` is fixed to 7 (all-I,
+   the encoder-preferred all-slices-I-type value, decodable exactly like
+   plain I (2) by `h264.decode`, which accepts both), `first-mb-in-slice`
+   fixed to 0, `pic-order-cnt-type` fixed to 0 (matching `h264.sps/encode`'s
+   own fixed choice) so only `log2-max-pic-order-cnt-lsb-minus4` bits (all
+   zero, per that fixed SPS choice) are written, and IDR-only
+   dec_ref_pic_marking flags (both written false — no long-term reference,
+   no prior-pics discard needed for a single-frame stream).
+
+   `sps`/`pps` are the maps this repo's OWN `h264.sps/encode`/`h264.pps/encode`
+   were called with (NOT `parse`'s output — same shape, but the caller
+   already has these since it built the SPS/PPS NALs). `slice-qp` is the
+   ABSOLUTE QP this slice codes at (this fn derives
+   `slice_qp_delta = slice-qp - pic-init-qp` from the PPS's own
+   `pic-init-qp`, so it can't drift from what the referenced PPS declares).
+   `idr-pic-id` should be a small non-negative int (this repo only ever
+   encodes a single IDR frame per stream, so 0 is fine)."
+  [w {:keys [log2-max-frame-num-minus4]}
+   {:keys [pic-init-qp deblocking-filter-control-present?]}
+   {:keys [frame-num idr-pic-id slice-qp]}]
+  (eg/write-ue! w 0)                                        ; first_mb_in_slice
+  (eg/write-ue! w 7)                                        ; slice_type = 7 (all I)
+  (eg/write-ue! w 0)                                        ; pic_parameter_set_id
+  (eg/write-bits! w (+ log2-max-frame-num-minus4 4) frame-num)
+  (eg/write-ue! w idr-pic-id)                               ; idr_pic_id (nal_unit_type=5 always for this encoder)
+  ;; pic_order_cnt_type is always 0 (h264.sps/encode's own fixed choice) —
+  ;; log2_max_pic_order_cnt_lsb_minus4 is always 0 there too, so exactly 4
+  ;; bits of pic_order_cnt_lsb are written (all zero — this repo only
+  ;; encodes a single picture, so POC value is immaterial).
+  (eg/write-bits! w 4 0)
+  (eg/write-flag! w false)                                  ; no_output_of_prior_pics_flag
+  (eg/write-flag! w false)                                  ; long_term_reference_flag
+  (eg/write-se! w (- slice-qp pic-init-qp))                 ; slice_qp_delta
+  ;; MUST mirror whatever the referenced PPS actually declared for
+  ;; deblocking_filter_control_present_flag (`h264.pps/encode`'s DEFAULT is
+  ;; true — omitting this field when the PPS says it's present would desync
+  ;; the bit reader on every subsequent syntax element, including the whole
+  ;; macroblock layer). When present, write disable_deblocking_filter_idc=1
+  ;; (fully disabled — matches this encoder's own no-deblocking-filter
+  ;; scope, so no slice_alpha_c0_offset_div2/slice_beta_offset_div2 follow).
+  (when deblocking-filter-control-present?
+    (eg/write-ue! w 1))
+  nil)
