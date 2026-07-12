@@ -81,6 +81,25 @@
 (def col-row->blk
   (into {} (map (fn [[k v]] [v k]) blk->col-row)))
 
+(def chroma-blk->col-row
+  "ChromaArrayType 1 (4:2:0) 4x4 chroma sub-block index (0..3, CAVLC/
+   residual decode order) → [col row] (both 0..1) within the 8x8 chroma
+   block's 2x2 grid. Plain RASTER order (0=[0,0] TL, 1=[1,0] TR, 2=[0,1]
+   BL, 3=[1,1] BR) — NOT the same as luma's `blk->col-row` first-4-entry
+   pattern (which is a column-major/Z-order convention: 0=[0,0] 1=[0,1]
+   2=[1,0] 3=[1,1]). This was assumed to be the SAME building block as
+   luma's (reasonable-looking given ffmpeg shares the `16 + 16*chroma_idx
+   + i4x4` index arithmetic with luma's own i4x4 sub-index) but that
+   assumption was WRONG and was caught empirically: a real multi-macroblock
+   x264-encoded color-gradient chroma golden vector decoded to a
+   right-shaped, WRONG-valued picture (AC coefficients swapped between the
+   TR and BL quadrants — i.e. transposed) until this raster convention was
+   substituted. Do not re-derive this from luma's convention by analogy."
+  {0 [0 0], 1 [1 0], 2 [0 1], 3 [1 1]})
+
+(def chroma-col-row->blk
+  (into {} (map (fn [[k v]] [v k]) chroma-blk->col-row)))
+
 (defn- i16x16-mb-info
   "mb_type (1..24, I_16x16_*) → {:pred-mode :cbp-luma :cbp-chroma} per
    Table 7-11. Throws for mb_type 0 (I_NxN) / 25 (I_PCM) / anything else
@@ -155,59 +174,74 @@
 
 (defn- clip8 [v] (max 0 (min 255 v)))
 
-(defn- decode-chroma-plane!
-  "Decode one 8x8 chroma component (Cb or Cr) of an Intra_16x16
-   macroblock: optional DC block (`cbp-chroma` >= 1) + optional 4 AC
-   blocks (`cbp-chroma` == 2) + Intra_Chroma prediction (`pred-mode`, per
-   `h264.intra-pred/predict-chroma-8x8`'s mode numbering) + reconstruction.
-   `left-c`/`top-c` are the neighbor MB's SAME-component chroma state (nil
-   at picture edges) — {:ac-nnz (4-elem vec) :top-row (8-elem vec)
-   :left-col (8-elem vec)}.
+(defn- decode-chroma-ac-blocks!
+  "Read the 4 chroma AC 4x4 blocks (`cbp-chroma` == 2) for ONE component
+   from reader `r`, given that component's already-decoded `dc-quad`
+   (RASTER order, see `decode-chroma-dc!`/`h264.transform/chroma-dc-hadamard`).
+   If `cbp-chroma` < 2, no bits are read and `block-coeffs` is just the DC
+   values overlaid onto otherwise-zero 4x4 arrays.
 
-   The 4 chroma 4x4 sub-blocks use the SAME block-index → (col,row)
-   convention as luma's `blk->col-row` (block 0/1/2/3 restricted to
-   col,row in #{0,1} — i.e. block 0=[0,0] 1=[0,1] 2=[1,0] 3=[1,1], the
-   same 2x2 pattern used within any one of luma's four 8x8 groups), NOT
-   raster order — but `h264.transform/chroma-dc-hadamard`'s `dc-quad`
-   output IS raster order (idx = row*2+col, ported directly from ffmpeg's
-   stride-addressed 2x2 dequant). These two orderings must be reconciled
-   explicitly (`(+ (* row 2) col)`) when overlaying a block's DC value —
-   getting this wrong silently produces a right-shaped, wrong-valued
-   picture (transposed top-right/bottom-left quadrants), the same failure
-   mode called out for luma's `blk->col-row` in this namespace's docstring.
+   IMPORTANT bitstream-order note (§7.3.5.3.3 `residual_block_cavlc`/
+   ffmpeg's `ff_h264_decode_mb_cavlc`): the actual NAL bit order for an
+   Intra_16x16 macroblock's chroma residual is [Cb DC, Cr DC, Cb AC x4, Cr
+   AC x4] — ALL DC blocks (both components) before ANY AC blocks, NOT
+   [Cb DC, Cb AC x4, Cr DC, Cr AC x4] (i.e. NOT fully decoding one
+   component before starting the other). This fn intentionally does ONLY
+   the AC read for a single component — callers (`h264.decode/decode-macroblock!`)
+   MUST call `decode-chroma-dc!` for BOTH components first, THEN call this
+   fn for both components, to match that order. Getting this wrong
+   silently desyncs the bit reader partway through the FIRST macroblock
+   that has real chroma AC residual (`cbp-chroma` == 2) — caught via a real
+   multi-macroblock color-gradient golden vector during development (DC-
+   only fixtures don't exercise this order at all).
 
-   `corner` is the diagonal top-left MB's bottom-right pixel of this SAME
-   component (only used/required for Plane mode, `pred-mode` 3 — see
-   `h264.intra-pred/predict-chroma-8x8`).
+   The 4 chroma 4x4 sub-blocks use `chroma-blk->col-row` (plain raster
+   order — NOT the same block-index convention as luma's `blk->col-row`,
+   see that def's docstring for the empirical mismatch this caused).
+   `dc-quad` is ALSO raster order (idx = row*2+col), so with
+   `chroma-blk->col-row` the two indices coincide (`b == row*2+col`) —
+   overlaying a block's DC value is a direct `(nth dc-quad b)`, no
+   remapping needed.
 
-   Returns {:recon (8x8 row-vector grid) :ac-nnz (4-elem vec) :top-row
-   (8-elem vec, this MB's bottom row) :left-col (8-elem vec, this MB's
-   right col)}."
-  [r qpc cbp-chroma pred-mode left-c top-c corner]
-  (let [dc-quad (if (pos? cbp-chroma)
-                  (:dc-quad (decode-chroma-dc! r qpc))
-                  [0 0 0 0])
-        ac-nnz (atom (vec (repeat 4 0)))
+   Returns {:block-coeffs (4-elem vector of 16-elem row-major coefficient
+   arrays) :ac-nnz (4-elem vec, this component's per-block total_coeff —
+   feeds neighbor `nC` derivation for MBs to the right/below)}."
+  [r qpc cbp-chroma dc-quad left-c top-c]
+  (let [ac-nnz (atom (vec (repeat 4 0)))
         block-coeffs
         (if (< cbp-chroma 2)
-          (mapv (fn [b] (let [[col row] (blk->col-row b)]
-                          (assoc (vec (repeat 16 0)) 0 (nth dc-quad (+ (* row 2) col)))))
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-quad b)))
                 (range 4))
           (mapv
            (fn [b]
-             (let [[col row] (blk->col-row b)
+             (let [[col row] (chroma-blk->col-row b)
                    nA (if (pos? col)
-                        (nth @ac-nnz (col-row->blk [(dec col) row]))
-                        (when left-c (nth (:ac-nnz left-c) (col-row->blk [1 row]))))
+                        (nth @ac-nnz (chroma-col-row->blk [(dec col) row]))
+                        (when left-c (nth (:ac-nnz left-c) (chroma-col-row->blk [1 row]))))
                    nB (if (pos? row)
-                        (nth @ac-nnz (col-row->blk [col (dec row)]))
-                        (when top-c (nth (:ac-nnz top-c) (col-row->blk [col 1]))))
+                        (nth @ac-nnz (chroma-col-row->blk [col (dec row)]))
+                        (when top-c (nth (:ac-nnz top-c) (chroma-col-row->blk [col 1]))))
                    nc (neighbor-nc nA nB)
                    {:keys [ac-raster total-coeff]} (decode-ac-block! r nc qpc)]
                (swap! ac-nnz assoc b total-coeff)
-               (assoc ac-raster 0 (nth dc-quad (+ (* row 2) col)))))
-           (range 4)))
-        top-row (:top-row top-c)
+               (assoc ac-raster 0 (nth dc-quad b))))
+           (range 4)))]
+    {:block-coeffs block-coeffs :ac-nnz @ac-nnz}))
+
+(defn- reconstruct-chroma-plane
+  "Pure (no bit reads) Intra_Chroma prediction + residual reconstruction
+   for ONE 8x8 chroma component, given its already-decoded `block-coeffs`
+   (from `decode-chroma-ac-blocks!`). `pred-mode` is per
+   `h264.intra-pred/predict-chroma-8x8`'s mode numbering. `left-c`/`top-c`
+   are the neighbor MB's SAME-component chroma state (nil at picture
+   edges) — {:top-row (8-elem vec) :left-col (8-elem vec)}; `corner` is
+   the diagonal top-left MB's bottom-right pixel of this SAME component
+   (only used/required for Plane mode, `pred-mode` 3).
+
+   Returns {:recon (8x8 row-vector grid) :top-row (8-elem vec, this MB's
+   bottom row) :left-col (8-elem vec, this MB's right col)}."
+  [block-coeffs pred-mode left-c top-c corner]
+  (let [top-row (:top-row top-c)
         left-col (:left-col left-c)
         pred-8x8 (intra-pred/predict-chroma-8x8 pred-mode
                                                  {:top-available? (some? top-c)
@@ -218,7 +252,7 @@
         recon (vec (repeat 8 (vec (repeat 8 0))))
         recon (reduce
                (fn [recon b]
-                 (let [[col row] (blk->col-row b)
+                 (let [[col row] (chroma-blk->col-row b)
                        pred4x4 (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in pred-8x8 [(+ (* row 4) ry) (+ (* col 4) rx)])))))
                        residual (transform/inverse-4x4 (nth block-coeffs b))]
                    (reduce
@@ -231,7 +265,6 @@
                     recon (range 4))))
                recon (range 4))]
     {:recon recon
-     :ac-nnz @ac-nnz
      :top-row (nth recon 7)
      :left-col (mapv #(nth % 7) recon)}))
 
@@ -255,7 +288,14 @@
         {:keys [pred-mode cbp-luma cbp-chroma]} (i16x16-mb-info mb-type)
         intra-chroma-pred-mode (eg/ue! r)
         mb-qp-delta (eg/se! r)
-        qp' (+ qp mb-qp-delta)
+        ;; §7.4.5: QPy = ((QPy,PREV + mb_qp_delta + 52 + 2*QpBdOffsetY) %
+        ;; (52 + QpBdOffsetY)) - QpBdOffsetY — modulo-52 WRAP, not plain
+        ;; addition (QpBdOffsetY=0 for this repo's 8-bit-only scope). A
+        ;; large negative mb_qp_delta (legal per spec, range -26..+25 for
+        ;; 8-bit) can otherwise push qp' negative or >51, which doesn't
+        ;; desync the bitstream (QP doesn't gate any CAVLC read) but DOES
+        ;; silently produce a wrong dequant scale.
+        qp' (mod (+ qp mb-qp-delta 52) 52)
         qpc (quant/chroma-qp qp' chroma-qp-index-offset)
         dc-nc (neighbor-nc (:dc-nnz left-mb) (:dc-nnz top-mb))
         dc-decoded (decode-luma-dc! r dc-nc qp')
@@ -301,10 +341,21 @@
                        recon (range 4)))
                     recon (range 4))))
                recon (range 16))
+        ;; Bitstream order (§7.3.5.3.3 / ffmpeg `ff_h264_decode_mb_cavlc`):
+        ;; Cb DC, Cr DC, Cb AC x4, Cr AC x4 — NOT Cb(DC+AC) then Cr(DC+AC).
+        ;; See `decode-chroma-ac-blocks!`'s docstring for why this matters.
+        cb-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        cr-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
         cb-corner (get-in topleft-mb [:cb :recon 7 7])
         cr-corner (get-in topleft-mb [:cr :recon 7 7])
-        cb (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
-        cr (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)]
+        cb-recon (reconstruct-chroma-plane cb-block-coeffs intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr-recon (reconstruct-chroma-plane cr-block-coeffs intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)
+        cb (assoc cb-recon :ac-nnz cb-ac-nnz)
+        cr (assoc cr-recon :ac-nnz cr-ac-nnz)]
     {:recon recon
      :qp qp'
      :pred-mode pred-mode
