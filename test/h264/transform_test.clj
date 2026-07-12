@@ -73,6 +73,37 @@
         (is (<= (Math/abs (- t d)) 300)
             "reconstructed DC should be within a small bounded quantization error of the target")))))
 
+(deftest chroma-dc-hadamard-fwd-matrix-self-consistent
+  (testing "H4 * H4^T = 4*I exactly (empirically probed against chroma-dc-hadamard, see def docstring) — confirms H4 is invertible with H4^-1 = H4^T/4 = H4/4 (symmetric), which forward-chroma-dc-hadamard relies on"
+    (let [H transform/chroma-dc-hadamard-fwd-matrix
+          Ht (vec (for [j (range 4)] (vec (for [i (range 4)] (get-in H [i j])))))
+          mat-mul (fn [A B] (vec (for [i (range 4)]
+                                    (vec (for [j (range 4)]
+                                           (reduce + (for [k (range 4)] (* (get-in A [i k]) (get-in B [k j])))))))))
+          HHt (mat-mul H Ht)]
+      (doseq [i (range 4) j (range 4)]
+        (is (= (if (= i j) 4 0) (get-in HHt [i j]))
+            (str "H4*H4^T[" i "][" j "] should be " (if (= i j) 4 0)))))))
+
+(deftest chroma-dc-hadamard-fwd-matrix-probed-correctly
+  (testing "chroma-dc-hadamard-fwd-matrix's columns match unit-impulse probes of the REAL, tested chroma-dc-hadamard (qmul=128 makes its dequant scaling the identity, exposing the raw linear map) — not hand-derived/guessed"
+    (doseq [i (range 4)]
+      (let [imp (assoc (vec (repeat 4 0)) i 1)
+            probed (transform/chroma-dc-hadamard imp 128)
+            expected-col (vec (for [row (range 4)] (get-in transform/chroma-dc-hadamard-fwd-matrix [row i])))]
+        (is (= expected-col probed) (str "impulse at position " i))))))
+
+(deftest forward-chroma-dc-hadamard-roundtrips-through-real-decode
+  (testing "forward-chroma-dc-hadamard is the exact linear inverse of chroma-dc-hadamard (up to integer rounding): encoding a target DC-quad then decoding it back via the REAL, tested chroma-dc-hadamard reproduces the target within a small, bounded quantization error (chroma-DC analogue of forward-luma-dc-hadamard-roundtrips-through-real-decode, no zigzag scan since chroma DC uses the identity scan — see h264.decode/decode-chroma-dc!'s docstring)"
+    (let [qp 26
+          qmul (quant/dc-qmul qp)
+          target (vec (repeatedly 4 #(- (rand-int 4001) 2000)))
+          raw (transform/forward-chroma-dc-hadamard target qmul)
+          decoded (transform/chroma-dc-hadamard raw qmul)]
+      (doseq [[t d] (map vector target decoded)]
+        (is (<= (Math/abs (- t d)) 300)
+            "reconstructed DC should be within a small bounded quantization error of the target")))))
+
 (deftest luma-dc-hadamard-single-impulse-spreads-uniformly
   (testing "luma-dc-hadamard is a real (non-identity) transform: a DC-domain impulse at (0,0) spreads to the same magnitude across all 16 blocks (forward Hadamard of a constant spatial block collapses to a single DC-domain impulse, so the inverse must do the reverse: spread it back out uniformly)"
     (let [raster (assoc (vec (repeat 16 0)) 0 64)
