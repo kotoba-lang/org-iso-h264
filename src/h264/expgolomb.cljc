@@ -37,3 +37,65 @@
     (if (odd? k) m (- m))))
 
 (defn flag! [r] (bit! r))
+
+;; --- encode side (Wave 2 addition, kotoba-lang/root ADR-2607121400) ---
+;; Bit writer mirroring `reader`/`bit!`/`bits!` above: accumulates bits
+;; MSB-first into whole bytes. `bytes!` finalizes (flushes a partial byte,
+;; zero-padded) and returns the accumulated byte vector.
+
+(defn writer []
+  {:out (atom []) :cur (atom 0) :nbits (atom 0)})
+
+(defn write-bit! [w bit]
+  (swap! (:cur w) #(bit-or (bit-shift-left % 1) (bit-and bit 1)))
+  (swap! (:nbits w) inc)
+  (when (= 8 @(:nbits w))
+    (swap! (:out w) conj @(:cur w))
+    (reset! (:cur w) 0)
+    (reset! (:nbits w) 0))
+  nil)
+
+(defn write-bits!
+  "Write the low `n` bits of `v`, MSB first."
+  [w n v]
+  (dotimes [i n] (write-bit! w (bit-and (bit-shift-right v (- n i 1)) 1))))
+
+(defn- bit-length [v] (loop [v v n 0] (if (zero? v) n (recur (bit-shift-right v 1) (inc n)))))
+
+(defn write-ue!
+  "Unsigned Exp-Golomb encode of non-negative `v` — inverse of `ue!`.
+   codeNum = v; write (bit-length(codeNum+1) - 1) leading zero bits, then
+   codeNum+1 itself in bit-length(codeNum+1) bits (MSB first) — the leading
+   `1` of that value is the Exp-Golomb stop bit, matching `ue!`'s read
+   order exactly."
+  [w v]
+  (let [code (inc v)
+        nbits (bit-length code)
+        leading-zeros (dec nbits)]
+    (dotimes [_ leading-zeros] (write-bit! w 0))
+    (write-bits! w nbits code)))
+
+(defn write-se!
+  "Signed Exp-Golomb encode — inverse of `se!` (H.264 §9.1.1 codeNum mapping)."
+  [w v]
+  (write-ue! w (if (<= v 0) (* -2 v) (dec (* 2 v)))))
+
+(defn write-flag! [w b] (write-bit! w (if b 1 0)))
+
+(defn rbsp-trailing-bits!
+  "Append rbsp_trailing_bits() (H.264 §7.3.2.11): a single stop bit `1`
+   then zero-pad to the next byte boundary. Must be called once, last,
+   before `bytes!`."
+  [w]
+  (write-bit! w 1)
+  (while (pos? @(:nbits w)) (write-bit! w 0)))
+
+(defn bytes!
+  "Finalize `w` into a plain byte vector. Flushes any partial byte
+   (zero-padded) if `rbsp-trailing-bits!` wasn't called first."
+  [w]
+  (when (pos? @(:nbits w))
+    (swap! (:out w) conj (bit-shift-left @(:cur w) (- 8 @(:nbits w))))
+    (reset! (:cur w) 0)
+    (reset! (:nbits w) 0))
+  @(:out w))

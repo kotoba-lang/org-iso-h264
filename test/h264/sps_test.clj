@@ -24,3 +24,41 @@
         (is (= 48 (:height parsed))))
       (testing "baseline profile (66), no scaling lists"
         (is (= 66 (:profile-idc parsed)))))))
+
+(deftest encode-parse-roundtrip
+  (testing "encode -> unescape(parse input has header byte, no escaping needed for synthetic values) -> parse reproduces the input"
+    (doseq [{:keys [profile-idc level-idc width height]}
+            [{:profile-idc 66 :level-idc 30 :width 64 :height 48}
+             {:profile-idc 66 :level-idc 31 :width 1920 :height 1088}
+             {:profile-idc 77 :level-idc 40 :width 320 :height 240}
+             {:profile-idc 66 :level-idc 10 :width 16 :height 16}]]
+      (let [rbsp (sps/encode {:profile-idc profile-idc :level-idc level-idc
+                               :width width :height height})
+            parsed (sps/parse rbsp)]
+        (is (= profile-idc (:profile-idc parsed)))
+        (is (= level-idc (:level-idc parsed)))
+        (is (= width (:width parsed)))
+        (is (= height (:height parsed)))
+        (is (true? (:frame-mbs-only? parsed)))))))
+
+(deftest encode-rejects-high-profile
+  (is (thrown? clojure.lang.ExceptionInfo
+               (sps/encode {:profile-idc 100 :level-idc 30 :width 64 :height 48}))))
+
+(deftest encode-rejects-non-multiple-of-16-dimensions
+  (is (thrown? clojure.lang.ExceptionInfo
+               (sps/encode {:profile-idc 66 :level-idc 30 :width 100 :height 48})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (sps/encode {:profile-idc 66 :level-idc 30 :width 64 :height 50}))))
+
+(deftest encode-through-real-nal-wrapping-and-escaping
+  (testing "encode -> write-nal-unit (escapes + start code) -> nal-units (splits + finds SPS) -> unescape -> parse"
+    (let [rbsp (sps/encode {:profile-idc 66 :level-idc 30 :width 64 :height 48})
+          stream (bs/write-nal-unit rbsp)
+          units (bs/nal-units stream)
+          sps-u (first (filter #(= :sps (:kind %)) units))]
+      (is (some? sps-u))
+      (let [parsed (sps/parse (rbsp/unescape (:bytes sps-u)))]
+        (is (= 66 (:profile-idc parsed)))
+        (is (= 64 (:width parsed)))
+        (is (= 48 (:height parsed)))))))

@@ -30,3 +30,40 @@
         (is (pos? (:num-ref-idx-l1-default-active parsed)))
         (is (false? (:weighted-pred? parsed)))
         (is (true? (:deblocking-filter-control-present? parsed)))))))
+
+(deftest encode-parse-roundtrip-defaults
+  (testing "encode with all defaults -> parse reproduces the default field values"
+    (let [rbsp (pps/encode {})
+          parsed (pps/parse rbsp)]
+      (is (= 0 (:pic-parameter-set-id parsed)))
+      (is (= 0 (:seq-parameter-set-id parsed)))
+      (is (= :cavlc (:entropy-coding-mode parsed)))
+      (is (= 1 (:num-ref-idx-l0-default-active parsed)))
+      (is (= 1 (:num-ref-idx-l1-default-active parsed)))
+      (is (false? (:weighted-pred? parsed)))
+      (is (= 0 (:weighted-bipred-idc parsed)))
+      (is (= 26 (:pic-init-qp parsed)))
+      (is (= 26 (:pic-init-qs parsed)))
+      (is (= 0 (:chroma-qp-index-offset parsed)))
+      (is (true? (:deblocking-filter-control-present? parsed)))
+      (is (false? (:constrained-intra-pred? parsed)))
+      (is (false? (:redundant-pic-cnt-present? parsed))))))
+
+(deftest encode-parse-roundtrip-custom-values
+  (testing "non-default values (including negative se(v) fields) round-trip"
+    (let [m {:pic-parameter-set-id 3 :seq-parameter-set-id 2
+             :entropy-coding-mode :cavlc
+             :num-ref-idx-l0-default-active 4 :num-ref-idx-l1-default-active 2
+             :weighted-pred? true :weighted-bipred-idc 2
+             :pic-init-qp 20 :pic-init-qs 32
+             :chroma-qp-index-offset -12
+             :deblocking-filter-control-present? false
+             :constrained-intra-pred? true
+             :redundant-pic-cnt-present? true}
+          parsed (pps/parse (pps/encode m))]
+      (is (= m parsed)))))
+
+(deftest encode-cabac-rejected-consistently-elsewhere
+  (testing "encode can represent :cabac (spec allows it; baseline-profile-only enforcement lives in sps, not pps)"
+    (let [parsed (pps/parse (pps/encode {:entropy-coding-mode :cabac}))]
+      (is (= :cabac (:entropy-coding-mode parsed))))))

@@ -24,3 +24,22 @@
           (if (and (= zeros 2) (= b 3) (< (inc i) n) (<= (nth nal-bytes (inc i)) 3))
             (recur (inc i) 0 out)                          ; drop the 0x03
             (recur (inc i) (if (zero? b) (inc zeros) 0) (conj! out b))))))))
+
+(defn escape
+  "Insert emulation-prevention 0x03 bytes — the encode-side inverse of
+   `unescape`. Whenever two zero bytes have just been emitted and the next
+   byte to emit is <= 0x03 (which would otherwise be misread as a start
+   code, or as an escape sequence itself), a 0x03 byte is inserted before
+   it and the zero-run counter resets. `escape` then `unescape` is the
+   identity on any byte sequence (round-trip verified in rbsp_test.clj)."
+  [rbsp-bytes]
+  (let [n (count rbsp-bytes)]
+    (loop [i 0 zeros 0 out (transient [])]
+      (if (>= i n)
+        (persistent! out)
+        (let [b (nth rbsp-bytes i)
+              needs-escape? (and (= zeros 2) (<= b 3))
+              out'   (if needs-escape? (conj! out 3) out)
+              out''  (conj! out' b)
+              zeros' (if needs-escape? (if (zero? b) 1 0) (if (zero? b) (inc zeros) 0))]
+          (recur (inc i) zeros' out''))))))

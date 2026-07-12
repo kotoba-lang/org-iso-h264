@@ -80,3 +80,52 @@
      :frame-mbs-only? frame-mbs-only?
      :width  width
      :height height}))
+
+;; --- encode side (Wave 2 addition, kotoba-lang/root ADR-2607121400) ---
+
+(defn encode
+  "Encode a minimal non-high-profile SPS RBSP (NAL header byte included at
+   index 0, matching `parse`'s convention) from {:profile-idc :level-idc
+   :seq-parameter-set-id :width :height}. Scope, deliberately narrow:
+   - `profile-idc` must NOT be in `high-profile-family` (throws otherwise —
+     chroma_format_idc/scaling-list signaling isn't implemented on encode).
+   - `frame_mbs_only_flag` is always written 1 (progressive only).
+   - No frame cropping: `width`/`height` must both be exact multiples of 16
+     (throws otherwise) — they become `pic_width_in_mbs_minus1`/
+     `pic_height_in_map_units_minus1` directly, with
+     `frame_cropping_flag` = 0.
+   - `pic_order_cnt_type` is always 0 with
+     `log2_max_pic_order_cnt_lsb_minus4` = 0.
+   - `vui_parameters_present_flag` is written 0 (present and correct per
+     spec, even though `parse` above doesn't read that far).
+   Round-trip verified against `parse` in sps_test.clj: `(parse (encode m))`
+   reproduces `:profile-idc`/`:level-idc`/`:width`/`:height`."
+  [{:keys [profile-idc level-idc seq-parameter-set-id width height]
+    :or {seq-parameter-set-id 0}}]
+  (when (contains? high-profile-family profile-idc)
+    (throw (ex-info "h264.sps/encode: high-profile SPS encode not implemented"
+                     {:profile-idc profile-idc})))
+  (when-not (and (zero? (mod width 16)) (zero? (mod height 16)))
+    (throw (ex-info "h264.sps/encode: width/height must be multiples of 16 (no frame_cropping support)"
+                     {:width width :height height})))
+  (let [w (eg/writer)
+        nal-header (bit-or (bit-shift-left 3 5) 7)]          ; nal_ref_idc=3, nal_unit_type=7 (SPS)
+    (eg/write-bits! w 8 nal-header)
+    (eg/write-bits! w 8 profile-idc)
+    (eg/write-bits! w 8 0)                                    ; constraint_set0..5_flag + reserved_zero_2bits
+    (eg/write-bits! w 8 level-idc)
+    (eg/write-ue! w seq-parameter-set-id)
+    ;; chroma_format_idc et al. only signaled for high-profile family — skipped
+    (eg/write-ue! w 0)                                        ; log2_max_frame_num_minus4
+    (eg/write-ue! w 0)                                        ; pic_order_cnt_type = 0
+    (eg/write-ue! w 0)                                        ; log2_max_pic_order_cnt_lsb_minus4
+    (eg/write-ue! w 0)                                        ; max_num_ref_frames
+    (eg/write-flag! w false)                                  ; gaps_in_frame_num_value_allowed_flag
+    (eg/write-ue! w (dec (quot width 16)))                    ; pic_width_in_mbs_minus1
+    (eg/write-ue! w (dec (quot height 16)))                   ; pic_height_in_map_units_minus1
+    (eg/write-flag! w true)                                   ; frame_mbs_only_flag
+    (eg/write-flag! w true)                                   ; direct_8x8_inference_flag
+    (eg/write-flag! w false)                                  ; frame_cropping_flag
+    (eg/write-flag! w false)                                  ; vui_parameters_present_flag
+    (eg/rbsp-trailing-bits! w)
+    (eg/bytes! w)))
