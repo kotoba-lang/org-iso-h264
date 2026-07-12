@@ -317,7 +317,42 @@
   "Order-`k0` Exp-Golomb, bypass-coded (§9.3.2.3's EGk, ported from
    `DecodeExpBypassCabac`): a unary prefix (each `1` bit doubles the implicit
    range and increments `k0`) terminated by a `0`, then `k0` more bypass
-   bits read directly (MSB-first) as the suffix value."
+   bits read directly (MSB-first) as the suffix value.
+
+   BUG FIX (multi-macroblock CABAC root-cause, see README \"Pixel decode:
+   CABAC\" and ADR-2607122000 addendum): the suffix accumulation MUST use a
+   SEPARATE accumulator from the prefix sum, the two ADDED together at the
+   end — exactly OpenH264's own `DecodeExpBypassCabac` (`iSymTmp` for the
+   prefix, a SEPARATE `iSymTmp2` for the suffix, `uiSymVal = iSymTmp +
+   iSymTmp2`). The previous version here reused the prefix's `sym` as the
+   suffix loop's OWN starting accumulator and OR'd suffix bits into it —
+   which is a SILENT NO-OP for every suffix value, because a `count`-bit
+   unary prefix always accumulates to exactly `2^count - 1` (ALL `count`
+   low bits already 1), and the suffix then OR's `count` MORE bits into
+   those SAME low bit positions, which can only ever leave them unchanged.
+   This made `coeff_abs_level_minus1` silently truncate to the truncated-
+   unary prefix's own value (`decode-ueg-level!`'s `code`) plus the wrong,
+   suffix-blind EG0 term, for EVERY coefficient whose magnitude was large
+   enough to saturate the cMax=13 truncated-unary bank in
+   `decode-ueg-level!` (i.e. `coeff_abs_level_minus1 >= 14`) — invisible on
+   `flat16-dc-only-cabac.h264`/`gradient16-ac-cabac.h264` (both single-MB,
+   ≤1 small significant coefficient, never reaching this code path at all)
+   but reliably wrong on real multi-macroblock/multi-coefficient content
+   the moment any one block's decoded magnitude got large enough to need
+   this suffix. Root-caused by an independent from-scratch Python
+   re-implementation (arithmetic engine + context tables cross-checked
+   programmatically against Cisco OpenH264's own `common_tables.cpp`, zero
+   diffs across all 460 context-init entries and every ctxIdxOffset/block-
+   category constant) that reproduced the IDENTICAL wrong bin sequence and
+   coefficient values as this namespace on a real multi-macroblock Main-
+   profile CABAC fixture — i.e. the entropy decode CONTROL FLOW (which
+   bins get read, in what order, against which contexts) was already
+   correct, only this one arithmetic combination step was wrong — then
+   confirmed by hand-tracing the actual bin sequence for the fixture's
+   affected DC block and finding the corrected value (`code + (prefix +
+   suffix) + 1`) exactly matches an independently-CAVLC-encoded reference
+   of near-identical content (`+29`/`+89` instead of the previous `+22`/
+   `+78` at two of the block's four significant positions)."
   [eng k0]
   (loop [count k0 sym 0]
     (let [bit (decode-bypass! eng)]
@@ -326,9 +361,9 @@
           (when (= count' 16)
             (throw (ex-info "h264.cabac: Exp-Golomb bypass unary prefix exceeded 16 (corrupt bitstream)" {})))
           (recur count' (+ sym (bit-shift-left 1 count))))
-        (loop [i count acc sym]
+        (loop [i count acc 0]
           (if (zero? i)
-            acc
+            (+ sym acc)
             (let [i' (dec i) b (decode-bypass! eng)]
               (recur i' (if (= b 1) (bit-or acc (bit-shift-left 1 i')) acc)))))))))
 
