@@ -24,13 +24,16 @@ now also implements a real, non-realtime, CAVLC + intra-only H.264
 baseline pixel decoder (`h264.decode` et al., see "Pixel decode" below),
 chroma (4:2:0) decode, the encode-side counterpart (`h264.encode`, Migration
 step 8, initially luma-only), real chroma (Cb/Cr) encode (see "Pixel
-encode" below), and — most recently — a first increment of **P-slice
-inter prediction decode** (`decode-gop`, Migration step 7's first
-increment: P_Skip + P_L0_16x16, MV=(0,0) motion compensation only, single
-reference frame — see "Pixel decode: P-slice (inter)" below). The original
-framing-only boundary still holds for **CABAC**, sub-pel/multi-reference/
-B-slice inter prediction, and inter-side ENCODE — those remain out of
-scope (see below for exactly what is/isn't covered).
+encode" below), **P-slice inter prediction decode** (`decode-gop`,
+Migration step 7: P_Skip + P_L0_16x16, single reference frame — see "Pixel
+decode: P-slice (inter)" below), and — most recently — **real sub-pel/
+non-zero motion compensation** for that same P_Skip/P_L0_16x16 path (luma
+quarter-sample + chroma eighth-sample interpolation, `h264.interp` — see
+"Sub-pel motion compensation" below). The original framing-only boundary
+still holds for **CABAC**, multi-reference/B-slice inter prediction,
+sub-partitioned motion (`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`),
+and inter-side ENCODE — those remain out of scope (see below for exactly
+what is/isn't covered).
 
 ## Namespaces
 
@@ -49,6 +52,7 @@ scope (see below for exactly what is/isn't covered).
 | `h264.intra-pred` | Intra_16x16 luma prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws. Intra_Chroma prediction (§8.3.4, 4:2:0 8x8 blocks, `predict-chroma-8x8`): ALL FOUR modes (DC/Horizontal/Vertical/Plane) on decode — see "Chroma decode" below for why Plane is implemented here but not for luma; encode's mode decision only ever selects DC/Horizontal/Vertical (see "Pixel encode") |
 | `h264.quant` | (also) `chroma-qp`: QPc derivation from QPy + PPS `chroma_qp_index_offset` (§8.5.8 Table 8-15) — reused unchanged by `h264.encode`'s chroma path |
 | `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. `decode-idr-frame` (single IDR picture, unchanged public API) AND `decode-gop` (a whole IDR+P sequence, new). See "Pixel decode" and "Pixel decode: P-slice (inter)" below for exact scope |
+| `h264.interp` | decode: luma quarter-sample (§8.4.2.2.1, 6-tap FIR + averaging) and chroma eighth-sample (§8.4.2.2.2, bilinear) sub-pel motion-compensated interpolation over a picture-boundary-extended plane. Pure functions, no bitstream dependency — `h264.decode/mc-predict` is the only caller. See "Sub-pel motion compensation" below |
 
 ## Validation
 
@@ -354,25 +358,20 @@ slice NAL and ignores anything else, so existing callers are unaffected.
   neighbors, with the correct "only one ref-idx matches" and "B/C both
   unavailable → copy A" special cases), NOT hardcoded to always return
   `[0 0]` — see `h264.decode/mv-predict-16x16`'s docstring.
-- **MV=(0,0) motion compensation ONLY** (`mc-predict`/`copy-block`): a
-  direct, unfiltered pixel copy of the co-located reference-frame block.
-  If the ACTUAL derived motion vector (predictor + mvd, or the P_Skip
-  predictor alone) is anything other than `[0 0]`, `decode-p-skip-macroblock!`/
-  `decode-inter-16x16-macroblock!` throw a clear, explicit error rather
-  than silently mis-decoding — sub-pel (6-tap luma / bilinear chroma) AND
-  integer-pel-but-nonzero motion compensation are BOTH out of scope for
-  this increment (even an integer-pixel luma shift generally implies a
-  fractional CHROMA shift under 4:2:0 subsampling whenever the shift is an
-  odd number of luma pixels, which would need chroma interpolation — see
-  `h264.decode/mc-predict`'s docstring). This was found to matter in
-  practice, not just in theory: real libx264 encodes of smooth-gradient
-  test content reliably chose non-zero (but still purely integer-pel)
-  motion vectors (`[0 4]`/`[0 16]`/`[0 32]` observed across several
-  fixtures during development) even at very restrictive `--merange`/`--me
-  dia`/`--subme 0` settings, because ANY spatial correlation gives real
-  motion search an incentive to explore a shift — see the P-slice test
-  fixtures' own docstring (`test/h264/decode_p_slice_test.clj`) for why
-  2 of the 3 golden vectors are hand-authored rather than x264 output.
+- **Real sub-pel motion compensation** (`mc-predict`, delegating to the new
+  `h264.interp` namespace — see "Sub-pel motion compensation" below):
+  luma quarter-sample interpolation (§8.4.2.2.1, 6-tap FIR
+  `(1,-5,20,20,-5,1)` for half-sample positions + rounded averaging for
+  quarter-sample positions) and chroma eighth-sample bilinear interpolation
+  (§8.4.2.2.2), for ANY motion vector — integer, half-pel, or quarter-pel,
+  in any direction. MV=(0,0) is simply the trivial degenerate case (a
+  direct sample read), not a separate code path. This replaces the
+  earlier MV=(0,0)-only increment's explicit throw-on-nonzero-mv guards in
+  `decode-p-skip-macroblock!`/`decode-inter-16x16-macroblock!` — real
+  libx264 was found (during the earlier increment's own development) to
+  reliably choose non-zero motion vectors for almost any real motion
+  content, so this was the natural next increment, not a hypothetical
+  concern.
 - **Inter luma residual**: unlike Intra_16x16 (which has a separate
   macroblock-level DC/Hadamard block plus 15-coefficient AC blocks), an
   inter (or `I_NxN`) macroblock's 16 luma 4x4 blocks are each a FULL
@@ -395,15 +394,18 @@ slice NAL and ignores anything else, so existing callers are unaffected.
 **What's explicitly NOT implemented** (out of scope, not silently wrong):
 CABAC (unchanged from the I-slice-only scope), B-slices, multiple
 reference frames / a real DPB, reference-list reordering, weighted
-prediction, adaptive (MMCO) reference-picture marking,
+prediction, adaptive (MMCO) reference-picture marking, and
 `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0` (sub-partitioned
-motion), and — critically — any motion vector other than exactly `[0 0]`
-(no sub-pel interpolation, no nonzero-but-integer-pel motion
-compensation). The encode side has NOT been extended for P-slices at all
-— `h264.encode` remains IDR-only.
+motion — still limited to ONE 16x16 partition/one motion vector per
+macroblock, per the calling task's own scope decision; sub-pel/non-zero
+motion compensation IS now implemented for that one partition, see below).
+The encode side has NOT been extended for P-slices at all — `h264.encode`
+remains IDR-only.
 
 **Validation.** `test/h264/decode_p_slice_test.clj` covers 3 golden
-vectors, all bit-exact (no tolerance) against real `ffmpeg 8.1.1`:
+vectors (the ORIGINAL MV=(0,0)-only increment, still passing unchanged
+now that MV=(0,0) is just the trivial case of the general sub-pel path),
+all bit-exact (no tolerance) against real `ffmpeg 8.1.1`:
 `p-skip-flat16.h264` (REAL libx264 output — 2 identical flat-gray frames,
 100% P_Skip), and `p-16x16-mb0-realac.h264`/
 `p-skip-then-16x16-multimb.h264` (hand-authored using this repo's OWN
@@ -416,7 +418,103 @@ coding within this repo's Intra_16x16-only scope, see that test file's
 own docstring for the full explanation and exactly why this is still a
 genuine independent-decoder cross-check, not a self-consistency
 tautology: real ffmpeg decodes these exact hand-authored bytes without
-having seen or trusted anything about how they were constructed).
+having seen or trusted anything about how they were constructed). See
+"Sub-pel motion compensation" below for the (real + hand-authored)
+non-zero/sub-pel golden vectors.
+
+## Sub-pel motion compensation (`h264.interp`, Migration step 7's sub-pel increment)
+
+`h264.interp` implements real luma quarter-sample (§8.4.2.2.1) and chroma
+eighth-sample (§8.4.2.2.2) interpolation, wired into `h264.decode/mc-predict`
+so P-slice motion compensation now handles ANY motion vector — this is the
+direct successor to the MV=(0,0)-only increment above, and the reason
+`decode-p-skip-macroblock!`/`decode-inter-16x16-macroblock!` no longer
+throw on a non-zero derived motion vector.
+
+**What's implemented:**
+- **Luma quarter-sample interpolation** (`quarter-pel-luma`): the 6-tap FIR
+  filter `(1,-5,20,20,-5,1)` for the 3 half-sample positions (`b`
+  horizontal, `h` vertical, `j` center), then plain rounded 2-way averaging
+  (`(a+b+1)>>1`) for all 12 quarter-sample positions — covers all 16
+  `(fx,fy)` fractional combinations (§8.4.2.2.1 Figure 8-4's full naming).
+  The center position `j` is the two-pass case that's easy to get subtly
+  wrong (see below): it is the vertical 6-tap filter applied to the
+  UNROUNDED, UNCLIPPED horizontal 6-tap sums at 6 rows, rounded ONCE at the
+  end via `(sum+512)>>10` — NOT independent horizontal-then-vertical
+  rounding/clipping.
+- **Chroma eighth-sample bilinear interpolation** (`eighth-pel-chroma`):
+  weights `A=(8-x)(8-y) B=x(8-y) C=(8-x)y D=xy` over the 2x2 integer-chroma
+  neighborhood, `(A·p00+B·p01+C·p10+D·p11+32)>>6` — for ChromaArrayType 1
+  (4:2:0), the chroma motion vector in eighth-CHROMA-sample units is
+  numerically IDENTICAL to the luma motion vector in quarter-LUMA-sample
+  units (chroma sample spacing is exactly 2x luma's, which exactly cancels
+  the 2x unit-scale difference — see `h264.interp/mc-chroma-block`'s
+  docstring), so no additional per-component MV scaling/derivation step is
+  needed beyond reinterpreting the SAME integer mv components.
+- **Picture-boundary extension**: reference samples outside the decoded
+  picture (needed both for the 6-tap filter's own ±2/+3 reach near picture
+  edges and for large motion vectors) are clamped to the nearest boundary
+  sample, per §8.4.2.2.1.
+- **Cross-checked against FFmpeg's actual reference-decoder source**
+  (`libavcodec/h264qpel_template.c`/`h264chroma_template.c`,
+  https://github.com/FFmpeg/FFmpeg), matching this repo's existing
+  discipline in `h264.quant`/`h264.transform` — NOT reconstructed from
+  memory of the spec prose alone. This mattered in practice: the classic
+  pitfall here is rounding/clipping the horizontal and vertical passes of
+  the center position `j` independently instead of carrying the
+  unrounded, unclipped intermediate sums through both passes and rounding
+  once — `h264.interp/center-j`'s docstring spells out exactly why the
+  two are NOT equivalent (they are, in fact, mathematically identical as
+  long as no intermediate rounding is introduced — the bug is introducing
+  rounding where the reference implementation doesn't).
+
+**Validation.** `test/h264/decode_p_subpel_test.clj` covers 3 golden
+vectors, all bit-exact (no tolerance) against real `ffmpeg 8.1.1`, plus
+`test/h264/interp_test.clj` unit-tests the interpolation arithmetic
+directly (hand-computed 6-tap/bilinear values, flat-plane invariance under
+every one of the 16 luma / 64 chroma fractional combinations, and
+picture-boundary clamping) independent of the bitstream machinery:
+- **`p-subpel-vertical64.h264`/`p-subpel-horizontal64.h264`** — REAL
+  libx264 (Constrained Baseline, CAVLC) 2-frame (IDR + P) streams: a
+  64x64 sinusoid varying smoothly along ONE axis only (so the IDR
+  reference frame stays within Intra_16x16 DC/Vertical/Horizontal, no
+  Intra_4x4/luma-Plane — see `horizontal-multimb64.h264` above for the
+  same forcing trick), whose phase shifts by a fractional (1.25px) amount
+  per frame — genuine temporal sub-pel motion, not merely re-evaluated
+  per-frame content. Real libx264 motion estimation (default `--subme`,
+  NOT `--subme 0`/`--preset ultrafast`, which would force full-pel-only
+  search) independently finds real quarter-pel motion vectors: `[0 -5]`/
+  `[0 -7]`/`[0 -9]` (vertical fixture) and `[-5 0]`/`[-7 0]` (horizontal
+  fixture) — every value intentionally NOT a multiple of 4, i.e. genuinely
+  fractional. Both fixtures mix real P_Skip (with a non-zero PREDICTED
+  motion vector — the first real-encoder evidence this repo's `p-skip-mv`
+  predictor path is correct for a non-zero case, not just the MV=(0,0)
+  case `p-skip-flat16.h264` already covered) and real P_L0_16x16
+  macroblocks.
+- **`p-subpel-diagonal32.h264`** — HAND-AUTHORED (this repo's OWN
+  `h264.encode` for a REAL, non-flat 2-D gradient IDR reference frame, plus
+  a hand-built P-slice NAL via `h264.expgolomb`'s writer — same methodology
+  as `p-16x16-mb0-realac.h264` above): real libx264, even with the
+  single-axis forcing trick, was not observed to select a genuinely 2-D
+  (both fx AND fy fractional) motion vector while also keeping every
+  P-frame macroblock free of luma Plane-mode intra coding (a real 2-axis
+  test image pushes some P-frame macroblocks to Plane, which this decoder
+  doesn't implement for luma). This fixture's 2 macroblocks carry motion
+  vectors `[6 10]` (fx=2,fy=2 — the CENTER `j` position, the single
+  hardest case) and `[13 7]` (fx=1,fy=3 — an "average of two half-samples"
+  position), both with zero residual (isolating pure motion compensation).
+  Independent check: real ffmpeg decodes these exact hand-authored bytes
+  bit-exact, with no `corrupted macroblock`/`error while decoding`
+  messages.
+
+Together these 3 fixtures (plus the 3 from the original MV=(0,0)
+increment) exercise every distinct arithmetic branch of
+`quarter-pel-luma`'s 16-way fractional dispatch at least once: plain
+integer position, the 3 half-sample positions (`b`/`h`/`j`), "average of
+integer + half-sample" (from the real single-axis fixtures), and "average
+of two half-samples" (from the hand-authored diagonal fixture) — not
+exhaustively all 16 `(fx,fy)` combinations individually, but every
+DISTINCT code path in the implementation.
 
 ## Pixel encode (Wave 5, ADR-2607122000 Migration step 8 + chroma-encode follow-up)
 
