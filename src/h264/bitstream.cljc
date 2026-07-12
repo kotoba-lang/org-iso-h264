@@ -8,7 +8,7 @@
    New implementation (not an extraction — utsushi.bitstream's split-annexb
    was an unimplemented TODO stub) as part of the kotoba-lang reverse-domain
    media/graphics standards-substrate split (com-junkawasaki/root)."
-  )
+  (:require [h264.rbsp :as rbsp]))
 
 (defn- start-code-len
   "Length of the start code beginning exactly at index `i` (3 or 4), or nil
@@ -64,3 +64,26 @@
                          :kind (nal-unit-types (:nal-unit-type h) :unspecified)
                          :bytes (subvec b (:start r) (:end r)))))
         (split-annexb b)))
+
+;; --- encode side (Wave 2 addition, kotoba-lang/root ADR-2607121400) ---
+
+(defn write-nal-unit
+  "Wrap `rbsp-with-header` (a byte vector with the 1-byte NAL header at
+   index 0 followed by the RBSP payload — the shape `h264.sps/encode` and
+   `h264.pps/encode` produce) with emulation-prevention escaping
+   (`h264.rbsp/escape`) and an Annex B start code, ready to concatenate
+   into a byte stream `nal-units`/`split-annexb` can split back apart.
+   `long-start-code?` (default true) selects the 4-byte `00 00 00 01`
+   start code over the 3-byte `00 00 01` form — both are spec-legal;
+   real encoders commonly use the long form for the first NAL of an
+   access unit."
+  ([rbsp-with-header] (write-nal-unit rbsp-with-header true))
+  ([rbsp-with-header long-start-code?]
+   (into (if long-start-code? [0 0 0 1] [0 0 1])
+         (rbsp/escape rbsp-with-header))))
+
+(defn write-annexb-stream
+  "Concatenate multiple `write-nal-unit`-wrapped NAL byte sequences into a
+   single Annex B stream."
+  [nal-unit-byte-seqs]
+  (vec (apply concat nal-unit-byte-seqs)))
