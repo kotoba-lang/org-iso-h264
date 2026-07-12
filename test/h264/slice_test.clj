@@ -1,13 +1,17 @@
 (ns h264.slice-test
   "Round-trip test for `h264.slice/encode-header!` (ADR-2607122000
-   Migration step 8) against the real, already-tested `parse-header!` —
-   the same discipline `h264.cavlc-test` uses for CAVLC encode."
+   Migration step 8) AND `h264.slice/encode-p-header!` (ADR-2607122000
+   P-slice encode increment) against the real, already-tested
+   `parse-header!` — the same discipline `h264.cavlc-test` uses for CAVLC
+   encode."
   (:require [clojure.test :refer [deftest is testing]]
             [h264.slice :as slice]
             [h264.expgolomb :as eg]))
 
 (def sps {:log2-max-frame-num-minus4 0 :pic-order-cnt-type 0 :log2-max-pic-order-cnt-lsb-minus4 0})
-(def pps {:pic-init-qp 26 :deblocking-filter-control-present? true})
+(def pps {:pic-init-qp 26 :deblocking-filter-control-present? true
+          :num-ref-idx-l0-default-active 1 :weighted-pred? false
+          :redundant-pic-cnt-present? false})
 
 (deftest encode-header-roundtrips
   (testing "encode-header! then parse-header! (with a 1-byte dummy NAL header prefix, matching parse-header!'s convention) reproduces the same slice-qp/frame-num"
@@ -51,4 +55,48 @@
           r (eg/reader bytes)
           _ (eg/bits! r 8)
           header (slice/parse-header! r sps pps-no-dbf 5 3)]
+      (is (= 26 (:slice-qp header))))))
+
+(deftest encode-p-header-roundtrips
+  (testing "encode-p-header! then parse-header! (nal-type=1 non-IDR, nal-ref-idc=0 so adaptive_ref_pic_marking_mode_flag is neither written nor read) reproduces slice-type-class :p, frame-num, and slice-qp, with num-ref-idx-l0-active resolving to the PPS default (1) with no override"
+    (let [w (eg/writer)
+          _ (eg/write-bits! w 8 0x01) ; dummy NAL header byte (nal_ref_idc=0, type=1)
+          _ (slice/encode-p-header! w sps pps {:frame-num 1 :slice-qp 24})
+          _ (eg/rbsp-trailing-bits! w)
+          bytes (eg/bytes! w)
+          r (eg/reader bytes)
+          _ (eg/bits! r 8)
+          header (slice/parse-header! r sps pps 1 0)]
+      (is (= :p (:slice-type-class header)))
+      (is (= 0 (:first-mb-in-slice header)))
+      (is (= 1 (:frame-num header)))
+      (is (nil? (:idr-pic-id header)))
+      (is (= 24 (:slice-qp header))))))
+
+(deftest encode-p-header-nonzero-nal-ref-idc-roundtrips
+  (testing "a nonzero nal-ref-idc (matching a real encoder's P-frame that's itself used as a future reference) writes/reads adaptive_ref_pic_marking_mode_flag=false without throwing"
+    (let [w (eg/writer)
+          _ (eg/write-bits! w 8 0x41) ; dummy NAL header byte (nal_ref_idc=2, type=1)
+          _ (slice/encode-p-header! w sps pps {:frame-num 3 :slice-qp 30 :nal-ref-idc 2})
+          _ (eg/rbsp-trailing-bits! w)
+          bytes (eg/bytes! w)
+          r (eg/reader bytes)
+          _ (eg/bits! r 8)
+          header (slice/parse-header! r sps pps 1 2)]
+      (is (= :p (:slice-type-class header)))
+      (is (= 3 (:frame-num header)))
+      (is (= 30 (:slice-qp header))))))
+
+(deftest encode-p-header-no-deblocking-field-when-absent
+  (testing "when the PPS says deblocking_filter_control_present_flag=false, no extra bits are written/expected (P-slice variant)"
+    (let [pps-no-dbf (assoc pps :deblocking-filter-control-present? false)
+          w (eg/writer)
+          _ (eg/write-bits! w 8 0x01)
+          _ (slice/encode-p-header! w sps pps-no-dbf {:frame-num 0 :slice-qp 26})
+          _ (eg/rbsp-trailing-bits! w)
+          bytes (eg/bytes! w)
+          r (eg/reader bytes)
+          _ (eg/bits! r 8)
+          header (slice/parse-header! r sps pps-no-dbf 1 0)]
+      (is (= :p (:slice-type-class header)))
       (is (= 26 (:slice-qp header))))))
