@@ -301,8 +301,10 @@
                        recon (range 4)))
                     recon (range 4))))
                recon (range 16))
-        cb (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cb left-mb) (:cb top-mb))
-        cr (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cr left-mb) (:cr top-mb))]
+        cb-corner (get-in topleft-mb [:cb :recon 7 7])
+        cr-corner (get-in topleft-mb [:cr :recon 7 7])
+        cb (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)]
     {:recon recon
      :qp qp'
      :pred-mode pred-mode
@@ -361,7 +363,8 @@
                   mb-y (quot addr mb-width)
                   left-mb (when (pos? mb-x) (nth states (dec addr)))
                   top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
-                  state (decode-macroblock! r qp chroma-qp-index-offset left-mb top-mb)]
+                  topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+                  state (decode-macroblock! r qp chroma-qp-index-offset left-mb top-mb topleft-mb)]
               (recur (inc addr) (:qp state) (conj states state)))))
         w (:width sps-map) h (:height sps-map)
         cw (quot w 2) ch (quot h 2)
