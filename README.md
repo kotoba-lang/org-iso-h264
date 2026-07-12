@@ -35,14 +35,18 @@ increment: integer-pel full-search + quarter-pel local-refinement motion
 estimation, P_Skip mode decision, P_L0_16x16 CAVLC-coded residual — see
 "Pixel encode: P-slice (inter)" below), and — most recently — a first
 **CABAC (main/high-profile entropy coding) decode** increment
-(`h264.cabac`, I-slice/Intra_16x16 scope so far, validated bit-exact
+(`h264.cabac`, I-slice/Intra_16x16 scope initially, validated bit-exact
 including multi-macroblock/multi-coefficient content — see "Pixel decode:
-CABAC" below for exactly what's validated). The original
-framing-only boundary still holds for CABAC + P-slice/inter prediction,
-multi-reference/B-slice inter prediction, sub-partitioned motion
-(`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`, both decode and
-encode), and CABAC encode — those remain out of scope (see below for
-exactly what is/isn't covered).
+CABAC" below for exactly what's validated), and — most recently —
+**CABAC + P-slice/inter prediction** (`P_Skip` + `P_L0_16x16`, the CABAC
+counterpart of the CAVLC-only P-slice increment above — see "Pixel
+decode: CABAC + P-slice (inter)" below). The original framing-only
+boundary still holds for multi-reference/B-slice inter prediction,
+sub-partitioned motion (`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/
+`P_8x8ref0`, both decode and encode), intra-coded macroblocks within a
+CABAC P-slice (CAVLC P-slices DO decode these, CABAC P-slices don't yet),
+and CABAC encode — those remain out of scope (see below for exactly what
+is/isn't covered).
 
 ## Namespaces
 
@@ -62,7 +66,7 @@ exactly what is/isn't covered).
 | `h264.quant` | (also) `chroma-qp`: QPc derivation from QPy + PPS `chroma_qp_index_offset` (§8.5.8 Table 8-15) — reused unchanged by `h264.encode`'s chroma path (intra AND inter) |
 | `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. `decode-idr-frame` (single IDR picture, unchanged public API) AND `decode-gop` (a whole IDR+P sequence, new). See "Pixel decode" and "Pixel decode: P-slice (inter)" below for exact scope |
 | `h264.interp` | decode: luma quarter-sample (§8.4.2.2.1, 6-tap FIR + averaging) and chroma eighth-sample (§8.4.2.2.2, bilinear) sub-pel motion-compensated interpolation over a picture-boundary-extended plane. Pure functions, no bitstream dependency. `h264.decode/mc-predict` is the decode-side caller; `h264.encode/mc-predict` (a small deliberate duplication, same convention as that namespace's `neighbor-nc`) calls the SAME `h264.interp` functions on the encode side, both for motion-compensated prediction AND to SCORE candidate motion vectors during motion estimation. See "Sub-pel motion compensation" below |
-| `h264.cabac` | decode: CABAC (Context-Adaptive Binary Arithmetic Coding, §9.3) entropy decode for main/high-profile streams — the literal per-bit arithmetic decoding engine (§9.3.3.2: `decode-decision!`/`decode-bypass!`/`decode-terminate!`, `range-tab-lps`/`trans-idx-lps`/`trans-idx-mps` per Tables 9-44/9-45), context-model initialization from SliceQPY (§9.3.1.1.1, I-slice-only `context-init-i` table, Tables 9-12..9-24), `mb_type`/`intra_chroma_pred_mode`/`mb_qp_delta` binarization, and `residual-block!` (`coded_block_flag`/`significant_coeff_flag`/`last_significant_coeff_flag`/`coeff_abs_level_minus1` combined, returning the SAME scan-order `{:coeffs :total-coeff}` shape `h264.cavlc/residual-block!` does so `h264.decode` shares its dequant/transform pipeline unchanged regardless of entropy method). **I-slice/Intra_16x16 ONLY** — see "Pixel decode: CABAC" below for exact scope and a known, not-yet-root-caused limitation (multi-macroblock pictures / residual blocks with 3+ significant coefficients) |
+| `h264.cabac` | decode: CABAC (Context-Adaptive Binary Arithmetic Coding, §9.3) entropy decode for main/high-profile streams — the literal per-bit arithmetic decoding engine (§9.3.3.2: `decode-decision!`/`decode-bypass!`/`decode-terminate!`, `range-tab-lps`/`trans-idx-lps`/`trans-idx-mps` per Tables 9-44/9-45), context-model initialization from SliceQPY (§9.3.1.1.1, `init-contexts` — I-slice's single `context-init-i` column OR, new, one of 3 `cabac_init_idc`-selected P-slice columns `context-init-p0/p1/p2`, Tables 9-12..9-24 all 4 columns), `mb_type` binarization for BOTH I-slice (`read-mb-type-i!`) AND P-slice (`read-mb-type-p!`, new — a DIFFERENT binarization tree), `mb_skip_flag` (`read-mb-skip-flag!`, new, P-slice only), `mvd_l0` (`read-mvd!`, new, UEG3 binarization), `coded_block_pattern` for INTER macroblocks (`read-coded-block-pattern-inter-cabac!`, new — a COMPLETELY DIFFERENT binarization from CAVLC's me(v) table lookup), `intra_chroma_pred_mode`/`mb_qp_delta` binarization (shared, slice-type-independent), and `residual-block!` (`coded_block_flag`/`significant_coeff_flag`/`last_significant_coeff_flag`/`coeff_abs_level_minus1` combined, now also covering a `:luma-regular` block category — the full 16-coefficient inter residual block — alongside the pre-existing `:luma-dc`/`:luma-ac`/`:chroma-dc`/`:chroma-ac`, returning the SAME scan-order `{:coeffs :total-coeff}` shape `h264.cavlc/residual-block!` does so `h264.decode` shares its dequant/transform pipeline unchanged regardless of entropy method). **I-slice/Intra_16x16 AND P-slice `P_Skip`/`P_L0_16x16`** — see "Pixel decode: CABAC" and "Pixel decode: CABAC + P-slice (inter)" below for exact scope (sub-partitioned inter, intra-in-P-slice, and B-slices remain out of scope) |
 
 ## Validation
 
@@ -391,14 +395,19 @@ tier as every other decode path here.
   §7.3.5.1's own `mb_qp_delta`/`residual()` presence condition (which
   explicitly includes `MbPartPredMode==Intra_16x16` as an alternative to
   `CodedBlockPatternLuma>0`). This means `h264.cabac`'s own
-  `coded_block_pattern` context model (ctxIdxOffset 73) is simply unused —
-  it's only needed for I_NxN/inter mb_types, both out of this repo's scope.
+  `coded_block_pattern` context model (ctxIdxOffset 73) is unused for
+  Intra_16x16 macroblocks specifically — it's used for INTER macroblocks
+  instead, see "Pixel decode: CABAC + P-slice (inter)" below
+  (`read-coded-block-pattern-inter-cabac!`); `I_NxN`'s own use of this same
+  context model remains out of scope (this repo never decodes `I_NxN`,
+  CABAC or CAVLC alike).
 
 **What's explicitly NOT implemented / not yet working** (out of scope, or
 a known limitation — see below for exactly which):
-- CABAC + P-slice/inter prediction (unchanged from every CAVLC-side scope
-  note — `h264.decode` throws if a CABAC-flagged PPS is combined with a
-  P-slice).
+- CABAC + P-slice/inter prediction is now PARTIALLY implemented — see
+  "Pixel decode: CABAC + P-slice (inter)" below for exactly what (`P_Skip`/
+  `P_L0_16x16`) and what's still out of scope (sub-partitioned inter,
+  intra-coded macroblocks within a CABAC P-slice, B-slices).
 - CABAC + `I_NxN`/`I_8x8`/`I_PCM` (same throw-on-unsupported-`mb_type`
   discipline as CAVLC, via the shared `i16x16-mb-info`).
 - `transform_size_8x8_flag`/8x8-transform CABAC contexts (High-Profile-only
@@ -474,6 +483,113 @@ reference of near-identical content, and the fixed decoder reproduces
 `multimb64-cabac.h264`'s real ffmpeg reconstruction bit-exact across all
 16 macroblocks (luma AND chroma).
 
+## Pixel decode: CABAC + P-slice (inter) (Wave 9, ADR-2607122000 CABAC+P-slice increment)
+
+`h264.cabac`/`h264.decode` combine the two previously-separate increments
+above (I-slice-only CABAC decode, and CAVLC-only P-slice inter prediction)
+for the first time: a CABAC-coded P-slice's `P_Skip` and `P_L0_16x16`
+macroblocks now decode, mirroring the CAVLC P-slice path's own scope
+exactly for those two mb_types.
+
+**What's implemented:**
+- **`mb_skip_flag`** (§9.3.3.1.1.3/Table 9-11 ctxIdxOffset 11,
+  `h264.cabac/read-mb-skip-flag!`) — read for EVERY macroblock address in
+  a CABAC P-slice (unlike CAVLC's run-length `mb_skip_run`), with real
+  cross-macroblock neighbor-context derivation (`left`/`top` available AND
+  not itself skipped).
+- **P-slice `mb_type` binarization** (§9.3.2.5/Table 9-37,
+  `h264.cabac/read-mb-type-p!`) — a bin-for-bin-different tree from
+  I-slice's own `read-mb-type-i!`, ported from OpenH264's
+  `ParseMBTypePSliceCabac`. Only `mb_type` 0 (`P_L0_16x16`) is decoded;
+  1..4 (sub-partitioned inter) throw explicitly (matching the CAVLC
+  P-slice path's own scope), and any intra-coded macroblock within this
+  CABAC P-slice ALSO throws explicitly (a narrower scope than the CAVLC
+  P-slice path, which DOES decode intra-in-P macroblocks — this
+  increment's own real-encoder validation fixtures don't exercise that
+  case, and adding it is a separate, not-yet-validated follow-up).
+- **`mvd_l0`** (§9.3.2.3 UEG3 binarization, `h264.cabac/read-mvd!`) — both
+  horizontal and vertical components, each with their own 7-context bank
+  and real neighbor-derived (`|left mvd| + |top mvd|`) ctxIdxInc, including
+  the EGk bypass-suffix continuation for large magnitudes (reusing
+  `decode-exp-golomb-bypass!`, the SAME helper — and the SAME earlier bug
+  fix — `coeff_abs_level_minus1` uses, just with `k0=3` instead of `k0=0`).
+- **`coded_block_pattern` for INTER macroblocks**
+  (`h264.cabac/read-coded-block-pattern-inter-cabac!`) — a COMPLETELY
+  DIFFERENT binarization from CAVLC's `me(v)`+`golomb-to-inter-cbp` table
+  lookup: one context-coded bin per 8x8 luma quadrant (context derived from
+  whether the spatially adjacent neighbor 8x8 block had residual) plus 2
+  more bins for `CodedBlockPatternChroma`.
+- **Inter luma residual** via a NEW CABAC block category, `:luma-regular`
+  (`h264.cabac/residual-block!`'s 4th category alongside `:luma-dc`/
+  `:luma-ac`/`:chroma-dc`/`:chroma-ac`) — the full 16-coefficient "regular"
+  4x4 block (no separate DC/Hadamard split), the CABAC counterpart of
+  `h264.decode/decode-regular-block!`'s CAVLC shape.
+- **Chroma residual is UNCHANGED** — `decode-chroma-dc-cabac!`/
+  `decode-chroma-ac-blocks-cabac!` (already validated by the I-slice CABAC
+  increment above) are reused for inter macroblocks too, entropy-agnostic
+  to the macroblock type — matching CAVLC's own "chroma residual doesn't
+  depend on mb_type" design.
+- **`cabac_init_idc`** (§7.3.3, `ue(v)` — NOT a fixed-width field, see the
+  bug note below) — a P-slice-only slice-header field selecting one of 3
+  P/B-only `(m,n)` context-init columns (`h264.cabac/context-init-p0/p1/p2`,
+  programmatically extracted from Cisco OpenH264's `common_tables.cpp`
+  using the SAME parser that produced the pre-existing I-slice column,
+  independently re-confirming that column's values too — zero diffs).
+
+**What's explicitly NOT implemented** (out of scope, not silently wrong):
+sub-partitioned inter (`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`),
+intra-coded macroblocks within a CABAC P-slice, B-slices, multiple
+reference frames, and everything else every other CABAC/P-slice scope
+note in this README already excludes.
+
+**Two real bugs were found and fixed while validating this increment
+against real x264/ffmpeg streams** (both root-caused via an independent
+from-scratch Python re-implementation, the same methodology the earlier
+EG0-bypass-suffix bug above used):
+
+1. **`cabac_init_idc` is `ue(v)` (Exp-Golomb), not a fixed 2-bit field.**
+   The first implementation read it as `u(2)` (a plausible-looking but
+   wrong guess) — cross-checked against FFmpeg's own `h264_slice.c`
+   (`get_ue_golomb_31`), which confirmed `ue(v)`. Caught immediately: the
+   wrong-width read desynced the very next field, decoding an
+   out-of-range `cabac_init_idc` value (3 — valid range is 0..2) on the
+   first real CABAC P-slice fixture tried.
+2. **`coded_block_flag`'s unavailable-neighbor default (§9.3.3.1.1.9) is
+   `!!IS_INTRA(CURRENT macroblock)`, not a fixed value** — the pre-existing
+   I-slice-only CABAC code correctly hardcoded `true` (every macroblock in
+   that scope IS intra), but the P-slice increment's first draft of
+   `decode-inter-16x16-macroblock-cabac!`'s luma/chroma-DC unavailable-
+   neighbor defaults, and the shared `decode-chroma-ac-blocks-cabac!`,
+   copied that SAME `true` verbatim instead of adjusting it for the
+   current macroblock actually being INTER (where the correct default is
+   `false`). Invisible on `p-skip-flat16-cabac.h264` (P_Skip reads no
+   residual at all); on `p-l0-16x16-multimb64-cabac.h264` this produced
+   real, substantial, plausible-shaped-but-wrong pixel corruption starting
+   from the macroblock immediately after the first one (the first
+   macroblock has no left/top neighbors at all, coincidentally hiding the
+   bug for it alone — confirmed by comparing motion-compensation-only
+   reconstruction, verified correct, against the full residual-included
+   reconstruction, verified wrong). Fixed by threading an `intra?`
+   parameter through the shared chroma-AC helper and using `false` for the
+   inter macroblock's own luma/chroma-DC unavailable-neighbor defaults —
+   see `h264.decode/decode-chroma-ac-blocks-cabac!`'s own docstring for
+   the full root-cause trail.
+
+**Validated bit-exact (no tolerance).** `test/h264/decode_p_slice_cabac_test.clj`
+validates 2 real `ffmpeg 8.1.1`/x264-encoded Main-profile CABAC fixtures
+bit-exact: `p-skip-flat16-cabac.h264` (2 identical flat frames, 100%
+`P_Skip` — the real-encoder log confirms `skip:100.0%`) and
+`p-l0-16x16-multimb64-cabac.h264` (64x64/16 macroblocks, a translating
+two-frequency luma texture, 100% `P_L0_16x16` with REAL nonzero luma AC
+residual in every one of the 16 macroblocks — the real-encoder log
+confirms `skip: 0.0%`/`P16..4: 100.0%`/`inter: 100.0%` luma coded — the
+strongest CABAC+P-slice interoperability evidence here: the full
+`mb_skip_flag`/`mb_type`/`mvd_l0`/`coded_block_pattern`/`mb_qp_delta`/
+16-regular-block-residual pipeline exercised across 16 real macroblocks
+with real cross-macroblock `coded_block_flag`/`mvd`/`cbp` neighbor-context
+derivation, reconstructing bit-exact against ffmpeg's own independent
+decode of the SAME real encoder output).
+
 ## Pixel decode: P-slice (inter) (Wave 6, ADR-2607122000 Migration step 7's first increment)
 
 `h264.decode/decode-gop` decodes a whole GOP (one IDR I-frame followed by
@@ -543,13 +659,15 @@ slice NAL and ignores anything else, so existing callers are unaffected.
   macroblock type at all.
 
 **What's explicitly NOT implemented** (out of scope, not silently wrong):
-CABAC (unchanged from the I-slice-only scope), B-slices, multiple
-reference frames / a real DPB, reference-list reordering, weighted
-prediction, adaptive (MMCO) reference-picture marking, and
-`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0` (sub-partitioned
-motion — still limited to ONE 16x16 partition/one motion vector per
-macroblock, per the calling task's own scope decision; sub-pel/non-zero
-motion compensation IS now implemented for that one partition, see below).
+CABAC + `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`/intra-in-P (CABAC
+`P_Skip`/`P_L0_16x16` ARE now implemented, see "Pixel decode: CABAC +
+P-slice (inter)" above), B-slices, multiple reference frames / a real DPB,
+reference-list reordering, weighted prediction, adaptive (MMCO)
+reference-picture marking, and `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/
+`P_8x8ref0` (sub-partitioned motion — still limited to ONE 16x16
+partition/one motion vector per macroblock, per the calling task's own
+scope decision; sub-pel/non-zero motion compensation IS now implemented
+for that one partition, see below).
 The encode side has NOT been extended for P-slices at all — `h264.encode`
 remains IDR-only.
 
