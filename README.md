@@ -204,30 +204,42 @@ values) — **luma AND chroma (Cb/Cr) both**, for every fixture below:
    (`:mb-pred-modes` is `[2 2 0 0]` — DC for the top row with no top
    neighbor, Vertical for the bottom row using actual reconstructed
    neighbor pixels).
+4. **`horizontal-multimb64.h264`** — 64x64 (4x4=16 macroblocks), luma
+   varying smoothly by ROW only (`sin` of Y, flat chroma), so libx264 has
+   a genuine RD reason to pick Intra_16x16 LUMA HORIZONTAL prediction
+   (mode 1) for most macroblocks once a left neighbor is available
+   (`:mb-pred-modes` is `[2 1 1 1 0 1 1 1 0 1 1 1 0 1 1 1]` — 12 of 16
+   Horizontal). This is the first bit-exact-validated real-encoder example
+   of luma Horizontal in a multi-macroblock picture — see
+   `test/h264/decode_test.clj`'s `horizontal-multimb64-golden-vector` for
+   the fixture's generation recipe and exactly what it exercises (both
+   `CodedBlockPatternLuma` 0 and 15 paths, real cross-macroblock nC
+   derivation for the Intra16x16 luma DC block specifically). This was a
+   real, previously-shipped, tracked bug (see git history / ADR for the
+   root-cause writeup): two independent bugs compounded — (a) the luma DC
+   block's cross-MB `nC` derivation read the wrong neighbor state, and (b)
+   `h264.decode/blk->col-row` used a wrong block-index-to-position mapping
+   AND `h264.transform/luma-dc-hadamard` was missing an input transpose —
+   both had to be fixed together (fixing either alone still fails, see
+   `blk->col-row`'s docstring for why). Root-caused and fixed by
+   cross-referencing FFmpeg's own `libavcodec/h264dec.c`/`h264_mb.c`
+   source rather than by guessing.
 
 Fixtures 1/2 are **single-macroblock pictures** (mode 0/1 Intra_16x16
 luma prediction is implemented but not exercised by either — a real
 encoder never selects Vertical/Horizontal for an unavailable neighbor).
-Fixture 3 is multi-macroblock and validates real chroma cross-macroblock
-decode plus luma DC/Vertical, **but does not include a bit-exact-validated
-real-encoder example of luma Horizontal (mode 1) in a multi-macroblock
-picture** — every real x264-encoded multi-macroblock stream tried during
-this development session that had libx264 actually select luma Horizontal
-also hit a still-unresolved decode desync a few macroblocks later
-(reproduced identically by an independent from-scratch Python CAVLC
-walker, so it isn't a Clojure-specific implementation bug in the parts
-already exercised — but the root cause wasn't found in the time available
-and is a genuine, open, tracked limitation, not hand-waved away). Luma
-Horizontal prediction ITSELF (`h264.intra-pred/predict-16x16` mode 1) is
-the identical code path as luma Vertical (already bit-exact-validated
-above) and is separately unit-tested (`intra_pred_test.clj`); the *chroma*
-Horizontal mode (structurally the same "copy left column" logic,
-`predict-chroma-8x8` mode 1) IS bit-exact-validated in a real
-multi-macroblock stream (fixture 3, MB1). Likewise the deblocking filter
-is not implemented at all; this only happens not to matter for these
-fixtures because they reconstruct to (locally) constant regions with zero
-gradient at block boundaries, where deblocking is a mathematical no-op —
-it has NOT been shown to be safe to skip in general.
+Fixture 3 validates real chroma cross-macroblock decode plus luma
+DC/Vertical. Fixture 4 validates real cross-macroblock luma Horizontal.
+Likewise the deblocking filter is not implemented at all; fixtures 1-3
+happen not to need it because they reconstruct to (locally) constant
+regions with zero gradient at block boundaries, where deblocking is a
+mathematical no-op — fixture 4 has a genuine cross-block-boundary
+gradient, so it's encoded with `--no-deblock` (`disable_deblocking_filter_idc=1`
+in the slice header, a properly signaled, spec-mandatory flag that any
+compliant decoder — including the real ffmpeg used for the reference
+output — MUST honor by skipping deblocking, not an encoder-side-only
+nicety). Deblocking itself has NOT been shown to be safe to skip in
+general beyond these fixtures.
 
 **Nonobvious implementation details, called out because a plausible-
 looking alternative silently produces wrong (but not obviously wrong —
@@ -249,16 +261,50 @@ i.e. right-shaped, wrong-valued) output:**
   for an isolated regression test of just this).
 - **Chroma sub-block bitstream/placement order is plain RASTER order
   (0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)** —
-  `h264.decode/chroma-blk->col-row` — which is a **different**
-  convention than luma's own 4x4-sub-block order
-  (`h264.decode/blk->col-row`, a column-major/Z-order convention). It's
-  tempting to assume chroma reuses the exact same building block as luma
-  (ffmpeg's internal index arithmetic uses the same `16 + 16*chroma_idx
-  + i4x4` numbering for both), but that assumption is WRONG and was
-  caught empirically: a real multi-macroblock color-gradient chroma
-  golden vector decoded to a right-shaped, wrong-valued picture
-  (top-right/bottom-left quadrant AC coefficients transposed) until the
-  raster convention was substituted for chroma specifically.
+  `h264.decode/chroma-blk->col-row`. Luma's own 4x4-sub-block order
+  (`h264.decode/blk->col-row`) uses the SAME plain-raster convention
+  (per-8x8-quadrant TL/TR/BL/BR, quadrants themselves in TL/TR/BL/BR
+  order) — see that def's docstring for the derivation (cross-checked
+  three ways against FFmpeg's `libavcodec/h264dec.c`/`h264_mb.c` source).
+  An EARLIER version of `blk->col-row` used a column-major/Z-order
+  variant instead (a transpose of the correct table) that went
+  undetected for a full development session because every fixture up to
+  that point had luma content that's symmetric under transpose — see the
+  "luma Horizontal desync" bullet below for how this was actually caught
+  and fixed. Do not assume luma and chroma need DIFFERENT conventions by
+  analogy with ffmpeg's shared `16 + 16*chroma_idx + i4x4` index
+  arithmetic — that arithmetic is shared, but the ACTUAL raster-vs-Z-order
+  choice must be independently verified for each (chroma correctly uses
+  raster; luma, after this fix, also correctly uses raster).
+- **Two independent bugs compounded to cause a real, previously-shipped,
+  multi-macroblock CAVLC desync/wrong-pixel bug whenever libx264 selected
+  Intra_16x16 LUMA HORIZONTAL prediction across macroblocks** (see
+  `test/h264/decode_test.clj`'s `horizontal-multimb64-golden-vector`, the
+  fixture that finally exercises this path): (1) `h264.decode/decode-macroblock!`'s
+  Intra16x16 luma DC block computed its cross-MB CAVLC `nC` from the
+  neighbor's OWN `:dc-nnz` (that neighbor macroblock's DC-block
+  total-coeff) instead of the neighbor's `:ac-nnz` at luma 4x4 block
+  position `[3,0]`/`[0,3]` — per ffmpeg's `pred_non_zero_count`, the DC
+  block's `nC` prediction reads the SAME neighbor cache cell as luma AC
+  block 0, which is explicitly ZERO-FILLED whenever that neighbor had
+  `CodedBlockPatternLuma=0` (DC-only), REGARDLESS of how many nonzero DC
+  coefficients that neighbor actually had. Using `:dc-nnz` instead
+  silently picks the wrong coeff_token VLC nC-class and desyncs the bit
+  reader on the very next macroblock with a real neighbor-derived DC
+  `nC`. (2) `h264.decode/blk->col-row` (see bullet above) AND
+  `h264.transform/luma-dc-hadamard` (missing the same kind of input
+  transpose `inverse-4x4` already has, see below) were BOTH wrong in a way
+  that happened to cancel out for every existing single-MB or flat-luma
+  fixture — fixing only one of the two, in isolation, produces a THIRD
+  wrong permutation, not a partial improvement (verified empirically
+  while root-causing this). Both root causes were found by cross-checking
+  FFmpeg's actual `libavcodec/h264dec.c`/`h264_mb.c`/`h264_cavlc.c` source
+  (`pred_non_zero_count`, `scan8[]`'s neighbor-addressing formula, the
+  `ref_index`/`scan8[0|4|8|12]` 8x8-partition assignment, and the
+  `dc_mapping[16]` table), not by static guessing — a real,
+  content-specific test (luma varying smoothly along ONE screen axis,
+  spanning multiple macroblocks with a real left/top neighbor) was
+  necessary to distinguish correct from incorrect in the first place.
 - **Chroma DC/AC residual bitstream order is Cb-DC, Cr-DC, Cb-AC (×4),
   Cr-AC (×4)** — NOT Cb(DC then AC) followed by Cr(DC then AC). Decoding
   one component fully before starting the other silently desyncs the bit
