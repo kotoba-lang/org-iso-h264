@@ -1,14 +1,20 @@
 (ns h264.cavlc
   "H.264 baseline-profile CAVLC residual entropy decode (ITU-T H.264 /
    ISO/IEC 14496-10 §9.2 \"CAVLC parsing process for transform coefficient
-   levels\"). Scope: luma blocks only (the Intra16x16 DC block, maxNumCoeff
-   16, and regular/AC 4x4 blocks, maxNumCoeff 15 or 16) — chroma DC/AC
-   VLC tables (§9.2.1's `nC == -1`/`-2` special cases) are NOT implemented
-   (this repo's decode scope is luma-only, see `h264.decode`).
+   levels\"). Scope: luma blocks (the Intra16x16 DC block, maxNumCoeff
+   16, and regular/AC 4x4 blocks, maxNumCoeff 15 or 16) AND the ChromaArrayType
+   1 (4:2:0) chroma DC special case (§9.2.1's `nC == -1`, maxNumCoeff 4,
+   `residual-block!` invoked with `nc` = `:chroma-dc`) — chroma AC 4x4
+   blocks reuse the SAME regular luma-shaped VLC tables/path (chroma AC
+   blocks are neighbor-derived like any other 4x4 block, per spec; only
+   the chroma DC block has its own nC==-1 special tables). ChromaArrayType
+   2/3 (4:2:2/4:4:4) chroma DC (`nC == -2`) is NOT implemented (this repo's
+   decode scope is 4:2:0 only, see `h264.decode`).
 
    All VLC tables (`coeff-token-len`/`coeff-token-bits` for the 4 nC
-   classes, `total-zeros-len`/`total-zeros-bits`, `run-len`/`run-bits`) are
-   transcribed byte-for-byte from FFmpeg's reference decoder
+   classes, `total-zeros-len`/`total-zeros-bits`, `run-len`/`run-bits`,
+   `chroma-dc-coeff-token-len`/`-bits`, `chroma-dc-total-zeros-len`/`-bits`)
+   are transcribed byte-for-byte from FFmpeg's reference decoder
    (`libavcodec/h264_cavlc.c`, https://github.com/FFmpeg/FFmpeg — these
    are themselves direct transcriptions of ITU-T H.264 Tables 9-5, 9-7,
    9-10). The decode algorithm (`residual-block!`) follows spec §9.2.1's
@@ -67,28 +73,61 @@
     32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
     48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63]])
 
+;; --- chroma DC coeff_token VLC, Table 9-5 nC==-1 special case (ChromaArrayType
+;;     1 / 4:2:0 only — one fixed table, no neighbor-derived nC class since the
+;;     chroma DC block always uses this same table regardless of neighbors).
+;;     Row-major [TotalCoeff 0..4][TrailingOnes 0..3]. ---
+
+(def chroma-dc-coeff-token-len
+  [2 0 0 0
+   6 1 0 0
+   6 6 3 0
+   6 7 7 6
+   6 8 8 7])
+
+(def chroma-dc-coeff-token-bits
+  [1 0 0 0
+   7 1 0 0
+   4 6 1 0
+   3 3 2 5
+   2 3 2 0])
+
+;; --- chroma DC total_zeros VLC, Table 9-9b (ChromaArrayType 1 / 4:2:0,
+;;     maxNumCoeff 4; row index = TotalCoeff-1, 1..3). ---
+
+(def chroma-dc-total-zeros-len
+  [[1 2 3 3]
+   [1 2 2]
+   [1 1]])
+
+(def chroma-dc-total-zeros-bits
+  [[1 1 1 0]
+   [1 1 0]
+   [1 0]])
+
 (defn- nc-class
   "nC → coeff_token VLC table row index (0: nC<2, 1: 2<=nC<4, 2: 4<=nC<8,
    3: nC>=8)."
   [nc]
   (cond (< nc 2) 0 (< nc 4) 1 (< nc 8) 2 :else 3))
 
-(defn- decode-coeff-token!
-  "Reads coeff_token via linear VLC search over `coeff-token-len`/`-bits`
-   for the given nC. Returns [total-coeff trailing-ones]."
-  [r nc]
-  (let [class (nc-class nc)
-        lens (nth coeff-token-len class)
-        bits (nth coeff-token-bits class)
-        start-byte @(:bytepos r) start-bit @(:bitpos r)
+(defn- decode-coeff-token-generic!
+  "Reads coeff_token via linear VLC search over a flat, row-major
+   [TotalCoeff 0..max-tc][TrailingOnes 0..3] `lens`/`bits` table. Returns
+   [total-coeff trailing-ones]. Shared by the regular (luma / chroma AC,
+   max-tc=16) and chroma-DC (nC==-1, max-tc=4) coeff_token tables — the
+   search algorithm is identical, only the table and its TotalCoeff bound
+   differ."
+  [r lens bits max-tc]
+  (let [start-byte @(:bytepos r) start-bit @(:bitpos r)
         max-len (apply max lens)]
     (loop [len 1]
       (when (> len max-len)
-        (throw (ex-info "h264.cavlc: no coeff_token VLC match" {:nc nc})))
+        (throw (ex-info "h264.cavlc: no coeff_token VLC match" {})))
       (reset! (:bytepos r) start-byte) (reset! (:bitpos r) start-bit)
       (let [code (eg/bits! r len)
             hit (loop [tc 0]
-                  (if (> tc 16)
+                  (if (> tc max-tc)
                     nil
                     (let [to-match
                           (loop [to 0]
@@ -106,6 +145,21 @@
               (eg/bits! r len)
               hit)
           (recur (inc len)))))))
+
+(defn- decode-coeff-token!
+  "Reads coeff_token for a regular (luma or chroma AC) 4x4/16-coeff block
+   via linear VLC search over `coeff-token-len`/`-bits` for the given nC.
+   Returns [total-coeff trailing-ones]."
+  [r nc]
+  (let [class (nc-class nc)]
+    (decode-coeff-token-generic! r (nth coeff-token-len class) (nth coeff-token-bits class) 16)))
+
+(defn- decode-chroma-dc-coeff-token!
+  "Reads coeff_token for the ChromaArrayType 1 (4:2:0) chroma DC block
+   (nC==-1 special case, §9.2.1) — a single fixed table, not neighbor-
+   derived. Returns [total-coeff trailing-ones]."
+  [r]
+  (decode-coeff-token-generic! r chroma-dc-coeff-token-len chroma-dc-coeff-token-bits 4))
 
 ;; --- total_zeros VLC, Table 9-7 (maxNumCoeff 16 — also used for the
 ;;     Intra16x16 luma DC block and luma AC (maxNumCoeff 15) blocks per
@@ -187,14 +241,19 @@
 (defn residual-block!
   "Decode one CAVLC residual_block (spec §9.2.1/9.2.2/9.2.3) from reader
    `r`. `nc` selects the coeff_token VLC class (already resolved by the
-   caller from neighbor total_coeff per §9.2.1 clause 9.2.1). `max-num-coeff`
-   is 16 for the Intra16x16 luma DC block and regular 4x4 luma blocks, 15
-   for Intra16x16 luma AC blocks.
+   caller from neighbor total_coeff per §9.2.1 clause 9.2.1) — OR the
+   keyword `:chroma-dc` to select the fixed nC==-1 chroma-DC table
+   (§9.2.1's special case; `max-num-coeff` must be 4 in that case, and no
+   neighbor derivation applies). `max-num-coeff` is 16 for the Intra16x16
+   luma DC block and regular 4x4 luma/chroma-AC blocks, 15 for Intra16x16
+   luma AC / chroma AC blocks, 4 for the chroma DC block.
 
    Returns {:coeffs (vector of `max-num-coeff` ints, SCAN-ORDER — the
    caller unscans via `codec-primitives.scan`) :total-coeff int}."
   [r nc max-num-coeff]
-  (let [[total-coeff trailing-ones] (decode-coeff-token! r nc)]
+  (let [[total-coeff trailing-ones] (if (= nc :chroma-dc)
+                                       (decode-chroma-dc-coeff-token! r)
+                                       (decode-coeff-token! r nc))]
     (if (zero? total-coeff)
       {:coeffs (vec (repeat max-num-coeff 0)) :total-coeff 0}
       (let [;; --- levels ---
@@ -223,8 +282,11 @@
                     (recur (inc i) suffix-length'' (conj acc v))))))
             zeros-left (if (= total-coeff max-num-coeff)
                          0
-                         (decode-flatlist-vlc! r (nth total-zeros-len (dec total-coeff))
-                                               (nth total-zeros-bits (dec total-coeff))))
+                         (if (= nc :chroma-dc)
+                           (decode-flatlist-vlc! r (nth chroma-dc-total-zeros-len (dec total-coeff))
+                                                 (nth chroma-dc-total-zeros-bits (dec total-coeff)))
+                           (decode-flatlist-vlc! r (nth total-zeros-len (dec total-coeff))
+                                                 (nth total-zeros-bits (dec total-coeff)))))
             run-vals
             (loop [i 0 zl zeros-left acc []]
               (if (= i (dec total-coeff))

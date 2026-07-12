@@ -18,13 +18,16 @@
      (`I_NxN`/Intra_4x4/Intra_8x8, requiring per-4x4-block adaptive
      prediction-mode signaling) and 25 (`I_PCM`) THROW rather than being
      silently mis-decoded.
-   - **Intra_16x16 prediction modes: DC/Vertical/Horizontal (0/1/2) only**
-     — mode 3 (Plane) throws.
-   - **Luma only — chroma is out of scope.** If a macroblock's derived
-     `CodedBlockPatternChroma` is nonzero (i.e. the bitstream actually
-     carries chroma residual bits), this throws rather than silently
-     desyncing the bit reader (there is deliberately no chroma CAVLC
-     table in `h264.cavlc`).
+   - **Intra_16x16 luma prediction modes: DC/Vertical/Horizontal (0/1/2)
+     only** — mode 3 (Plane) throws.
+   - **Chroma (Cb/Cr): ChromaArrayType 1 (4:2:0) only, DC/Horizontal/
+     Vertical Intra_Chroma prediction (modes 0/1/2 per Table 8-5's OWN
+     numbering — a different permutation than luma's, see
+     `h264.intra-pred`) — mode 3 (Plane) throws.** Chroma DC (nC==-1
+     special CAVLC table) and chroma AC (regular neighbor-derived 4x4
+     blocks, reusing the luma AC path with QPc instead of QPy) are both
+     implemented — this is new as of the chroma-decode follow-up to Phase 1
+     (see \"Pixel decode\" below); any other `chroma_format_idc` throws.
    - **No deblocking filter** — `h264.slice` reads and discards the
      deblocking-control fields; the reconstructed picture is the raw
      (pre-deblock) reconstruction. This only matters at block boundaries
@@ -33,15 +36,17 @@
    - **No POC/reference-picture-buffer bookkeeping beyond what's needed to
      parse a single slice header.**
 
-   Given these constraints, `decode-idr-frame` returns a single decoded
-   luma plane (flat byte vector, row-major, width*height, values 0..255)
-   for a picture whose width/height (from SPS) are exact multiples of 16
-   (no frame cropping — matches `h264.sps/encode`'s own encode-side
-   limitation elsewhere in this repo).
+   Given these constraints, `decode-idr-frame` returns decoded luma AND
+   chroma planes ({:luma :cb :cr}, each a flat byte vector, row-major,
+   values 0..255 — luma is width*height, Cb/Cr are each (width/2)*(height/2)
+   per 4:2:0 subsampling) for a picture whose width/height (from SPS) are
+   exact multiples of 16 (no frame cropping — matches `h264.sps/encode`'s
+   own encode-side limitation elsewhere in this repo).
 
    New implementation as part of the kotoba-lang reverse-domain
    media/graphics standards-substrate split (com-junkawasaki/root),
-   ADR-2607122000 Phase 1 (\"R0.5\")."
+   ADR-2607122000 Phase 1 (\"R0.5\") + a chroma-decode / multi-macroblock
+   V/H-prediction follow-up."
   (:require [h264.bitstream :as bs]
             [h264.rbsp :as rbsp]
             [h264.sps :as sps]
@@ -115,12 +120,15 @@
         dc-per-block (transform/luma-dc-hadamard raster (quant/dc-qmul qp))]
     {:dc-per-block dc-per-block :total-coeff total-coeff}))
 
-(defn- decode-luma-ac!
-  "Decode one Intra16x16 AC 4x4 block (scan positions 1..15, maxNumCoeff
-   15). Returns {:raster (15-elem seq of [pos level]) :total-coeff int}
-   with dequantized levels, ready to overlay onto a block's coefficient
-   array at positions 1..15 (position 0 is the DC value, handled
-   separately)."
+(defn- decode-ac-block!
+  "Decode one regular AC 4x4 block (scan positions 1..15, maxNumCoeff 15).
+   Shared by Intra16x16 luma AC blocks AND chroma AC blocks (§8.5.9's
+   per-position dequant formula is identical for both — only the `qp`
+   value passed in differs: QPy for luma, QPc — `h264.quant/chroma-qp` —
+   for chroma). Returns {:ac-raster (16-elem vector, position 0 always 0 —
+   the caller overlays the DC value) :total-coeff int} with dequantized
+   levels, ready to overlay onto a block's coefficient array at positions
+   1..15 (position 0 is the DC value, handled separately)."
   [r nc qp]
   (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 15)
         ac-zigzag (subvec zigzag 1)
@@ -136,23 +144,119 @@
                        (range 16))
      :total-coeff total-coeff}))
 
+(defn- decode-chroma-dc!
+  "Decode one ChromaArrayType 1 (4:2:0) chroma DC block (nC==-1, maxNumCoeff
+   4). Returns {:dc-quad (4-elem vector, RASTER order idx=row*2+col — see
+   `h264.transform/chroma-dc-hadamard`) :total-coeff int}."
+  [r qpc]
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r :chroma-dc 4)
+        dc-quad (transform/chroma-dc-hadamard coeffs (quant/dc-qmul qpc))]
+    {:dc-quad dc-quad :total-coeff total-coeff}))
+
 (defn- clip8 [v] (max 0 (min 255 v)))
 
+(defn- decode-chroma-plane!
+  "Decode one 8x8 chroma component (Cb or Cr) of an Intra_16x16
+   macroblock: optional DC block (`cbp-chroma` >= 1) + optional 4 AC
+   blocks (`cbp-chroma` == 2) + Intra_Chroma prediction (`pred-mode`, per
+   `h264.intra-pred/predict-chroma-8x8`'s mode numbering) + reconstruction.
+   `left-c`/`top-c` are the neighbor MB's SAME-component chroma state (nil
+   at picture edges) — {:ac-nnz (4-elem vec) :top-row (8-elem vec)
+   :left-col (8-elem vec)}.
+
+   The 4 chroma 4x4 sub-blocks use the SAME block-index → (col,row)
+   convention as luma's `blk->col-row` (block 0/1/2/3 restricted to
+   col,row in #{0,1} — i.e. block 0=[0,0] 1=[0,1] 2=[1,0] 3=[1,1], the
+   same 2x2 pattern used within any one of luma's four 8x8 groups), NOT
+   raster order — but `h264.transform/chroma-dc-hadamard`'s `dc-quad`
+   output IS raster order (idx = row*2+col, ported directly from ffmpeg's
+   stride-addressed 2x2 dequant). These two orderings must be reconciled
+   explicitly (`(+ (* row 2) col)`) when overlaying a block's DC value —
+   getting this wrong silently produces a right-shaped, wrong-valued
+   picture (transposed top-right/bottom-left quadrants), the same failure
+   mode called out for luma's `blk->col-row` in this namespace's docstring.
+
+   `corner` is the diagonal top-left MB's bottom-right pixel of this SAME
+   component (only used/required for Plane mode, `pred-mode` 3 — see
+   `h264.intra-pred/predict-chroma-8x8`).
+
+   Returns {:recon (8x8 row-vector grid) :ac-nnz (4-elem vec) :top-row
+   (8-elem vec, this MB's bottom row) :left-col (8-elem vec, this MB's
+   right col)}."
+  [r qpc cbp-chroma pred-mode left-c top-c corner]
+  (let [dc-quad (if (pos? cbp-chroma)
+                  (:dc-quad (decode-chroma-dc! r qpc))
+                  [0 0 0 0])
+        ac-nnz (atom (vec (repeat 4 0)))
+        block-coeffs
+        (if (< cbp-chroma 2)
+          (mapv (fn [b] (let [[col row] (blk->col-row b)]
+                          (assoc (vec (repeat 16 0)) 0 (nth dc-quad (+ (* row 2) col)))))
+                (range 4))
+          (mapv
+           (fn [b]
+             (let [[col row] (blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @ac-nnz (col-row->blk [(dec col) row]))
+                        (when left-c (nth (:ac-nnz left-c) (col-row->blk [1 row]))))
+                   nB (if (pos? row)
+                        (nth @ac-nnz (col-row->blk [col (dec row)]))
+                        (when top-c (nth (:ac-nnz top-c) (col-row->blk [col 1]))))
+                   nc (neighbor-nc nA nB)
+                   {:keys [ac-raster total-coeff]} (decode-ac-block! r nc qpc)]
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-quad (+ (* row 2) col)))))
+           (range 4)))
+        top-row (:top-row top-c)
+        left-col (:left-col left-c)
+        pred-8x8 (intra-pred/predict-chroma-8x8 pred-mode
+                                                 {:top-available? (some? top-c)
+                                                  :left-available? (some? left-c)
+                                                  :top-row top-row
+                                                  :left-col left-col
+                                                  :corner corner})
+        recon (vec (repeat 8 (vec (repeat 8 0))))
+        recon (reduce
+               (fn [recon b]
+                 (let [[col row] (blk->col-row b)
+                       pred4x4 (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in pred-8x8 [(+ (* row 4) ry) (+ (* col 4) rx)])))))
+                       residual (transform/inverse-4x4 (nth block-coeffs b))]
+                   (reduce
+                    (fn [recon ry]
+                      (reduce
+                       (fn [recon rx]
+                         (let [v (clip8 (+ (get-in pred4x4 [ry rx]) (get-in residual [ry rx])))]
+                           (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)] v)))
+                       recon (range 4)))
+                    recon (range 4))))
+               recon (range 4))]
+    {:recon recon
+     :ac-nnz @ac-nnz
+     :top-row (nth recon 7)
+     :left-col (mapv #(nth % 7) recon)}))
+
 (defn- decode-macroblock!
-  "Decode one Intra_16x16 macroblock from reader `r`. `qp` is this MB's
-   QPy (already resolved by the caller from slice_qp + running
-   mb_qp_delta). `left-mb`/`top-mb` are the neighbor MB states (or nil if
-   unavailable — picture edge). Returns {:recon (16x16 row-vector grid)
-   :dc-nnz int :ac-nnz (16-elem vector)}."
-  [r qp left-mb top-mb]
+  "Decode one Intra_16x16 macroblock (luma + chroma) from reader `r`. `qp`
+   is this MB's QPy (already resolved by the caller from slice_qp +
+   running mb_qp_delta). `chroma-qp-index-offset` is PPS
+   `chroma_qp_index_offset` (see `h264.quant/chroma-qp`; applied to BOTH
+   Cb and Cr, see that fn's docstring for why). `left-mb`/`top-mb` are the
+   neighbor MB states (or nil if unavailable — picture edge), carrying
+   BOTH luma (`:dc-nnz`/`:ac-nnz`/`:top-row`/`:left-col`) and per-component
+   chroma (`:cb`/`:cr`, each {:ac-nnz :top-row :left-col}) neighbor state.
+   `topleft-mb` is the diagonal top-left neighbor MB state (or nil), used
+   ONLY for chroma Plane mode's corner sample (raster-scan single-slice
+   decode guarantees it's already reconstructed whenever both `left-mb`
+   and `top-mb` are available, see `h264.intra-pred/chroma-plane-grid`).
+   Returns {:recon (16x16 luma row-vector grid) :cb :cr (8x8 chroma
+   row-vector grids) :dc-nnz :ac-nnz (luma) :cb-ac-nnz :cr-ac-nnz ...}."
+  [r qp chroma-qp-index-offset left-mb top-mb topleft-mb]
   (let [mb-type (eg/ue! r)
         {:keys [pred-mode cbp-luma cbp-chroma]} (i16x16-mb-info mb-type)
-        _ (when (pos? cbp-chroma)
-            (throw (ex-info "h264.decode: chroma residual present (CodedBlockPatternChroma != 0) — chroma is out of scope"
-                             {:cbp-chroma cbp-chroma})))
-        _intra-chroma-pred-mode (eg/ue! r)
+        intra-chroma-pred-mode (eg/ue! r)
         mb-qp-delta (eg/se! r)
         qp' (+ qp mb-qp-delta)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
         dc-nc (neighbor-nc (:dc-nnz left-mb) (:dc-nnz top-mb))
         dc-decoded (decode-luma-dc! r dc-nc qp')
         dc-per-block (:dc-per-block dc-decoded)
@@ -171,7 +275,7 @@
                         (nth @ac-nnz (col-row->blk [col (dec row)]))
                         (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [col 3]))))
                    nc (neighbor-nc nA nB)
-                   {:keys [ac-raster total-coeff]} (decode-luma-ac! r nc qp')]
+                   {:keys [ac-raster total-coeff]} (decode-ac-block! r nc qp')]
                (swap! ac-nnz assoc b total-coeff)
                (assoc ac-raster 0 (nth dc-per-block b))))
            (range 16)))
@@ -196,18 +300,26 @@
                            (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)] v)))
                        recon (range 4)))
                     recon (range 4))))
-               recon (range 16))]
+               recon (range 16))
+        cb (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cb left-mb) (:cb top-mb))
+        cr (decode-chroma-plane! r qpc cbp-chroma intra-chroma-pred-mode (:cr left-mb) (:cr top-mb))]
     {:recon recon
      :qp qp'
+     :pred-mode pred-mode
+     :intra-chroma-pred-mode intra-chroma-pred-mode
      :dc-nnz dc-total-coeff
      :ac-nnz @ac-nnz
      :top-row (nth recon 15)
-     :left-col (mapv #(nth % 15) recon)}))
+     :left-col (mapv #(nth % 15) recon)
+     :cb cb
+     :cr cr}))
 
 (defn decode-idr-frame
   "Decode a single-IDR-I-slice Annex B H.264 elementary stream `annexb-bytes`
    (a byte vector — see `h264.bitstream/nal-units`). Returns {:width
-   :height :luma (flat row-major byte vector, width*height, 0..255)}.
+   :height :luma (flat row-major byte vector, width*height, 0..255) :cb
+   :cr (flat row-major byte vectors, (width/2)*(height/2), 0..255 —
+   ChromaArrayType 1 / 4:2:0 only, see namespace docstring)}.
 
    See namespace docstring for the (deliberately narrow) supported scope."
   [annexb-bytes]
@@ -224,6 +336,9 @@
             (throw (ex-info "h264.decode: width must be a multiple of 16 (no frame-cropping support)" {:width (:width sps-map)})))
         _ (when (pos? (mod (:height sps-map) 16))
             (throw (ex-info "h264.decode: height must be a multiple of 16 (no frame-cropping support)" {:height (:height sps-map)})))
+        _ (when (not= 1 (:chroma-format-idc sps-map))
+            (throw (ex-info "h264.decode: only chroma_format_idc=1 (4:2:0) chroma decode is supported"
+                             {:chroma-format-idc (:chroma-format-idc sps-map)})))
         mb-width (quot (:width sps-map) 16)
         mb-height (quot (:height sps-map) 16)
         slice-rbsp (rbsp/unescape (:bytes slice-u))
@@ -237,6 +352,7 @@
             (throw (ex-info "h264.decode: only a single slice covering the whole picture (first_mb_in_slice=0) is supported"
                              {:first-mb-in-slice (:first-mb-in-slice header)})))
         num-mb (* mb-width mb-height)
+        chroma-qp-index-offset (:chroma-qp-index-offset pps-map)
         mb-states
         (loop [addr 0 qp (:slice-qp header) states []]
           (if (= addr num-mb)
@@ -245,22 +361,36 @@
                   mb-y (quot addr mb-width)
                   left-mb (when (pos? mb-x) (nth states (dec addr)))
                   top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
-                  state (decode-macroblock! r qp left-mb top-mb)]
+                  state (decode-macroblock! r qp chroma-qp-index-offset left-mb top-mb)]
               (recur (inc addr) (:qp state) (conj states state)))))
-        luma (vec (repeat (* (:width sps-map) (:height sps-map)) 0))
-        luma (reduce
-              (fn [luma addr]
-                (let [mb-x (mod addr mb-width)
-                      mb-y (quot addr mb-width)
-                      recon (:recon (nth mb-states addr))
-                      w (:width sps-map)]
-                  (reduce
-                   (fn [luma ry]
-                     (reduce
-                      (fn [luma rx]
-                        (assoc luma (+ (* (+ (* mb-y 16) ry) w) (* mb-x 16) rx)
-                               (get-in recon [ry rx])))
-                      luma (range 16)))
-                   luma (range 16))))
-              luma (range num-mb))]
-    {:width (:width sps-map) :height (:height sps-map) :luma luma}))
+        w (:width sps-map) h (:height sps-map)
+        cw (quot w 2) ch (quot h 2)
+        assemble (fn [blk-size plane-w plane-h recon-fn]
+                   (reduce
+                    (fn [plane addr]
+                      (let [mb-x (mod addr mb-width)
+                            mb-y (quot addr mb-width)
+                            recon (recon-fn (nth mb-states addr))]
+                        (reduce
+                         (fn [plane ry]
+                           (reduce
+                            (fn [plane rx]
+                              (assoc plane (+ (* (+ (* mb-y blk-size) ry) plane-w) (* mb-x blk-size) rx)
+                                     (get-in recon [ry rx])))
+                            plane (range blk-size)))
+                         plane (range blk-size))))
+                    (vec (repeat (* plane-w plane-h) 0))
+                    (range num-mb)))
+        luma (assemble 16 w h #(:recon %))
+        cb (assemble 8 cw ch #(:recon (:cb %)))
+        cr (assemble 8 cw ch #(:recon (:cr %)))]
+    {:width w :height h :luma luma :cb cb :cr cr
+     ;; per-MB Intra16x16 luma pred mode (0=Vertical/1=Horizontal/2=DC) and
+     ;; Intra_Chroma pred mode (0=DC/1=Horizontal/2=Vertical, Table 8-5's
+     ;; OWN numbering — see `h264.intra-pred`), raster order, one entry per
+     ;; macroblock — exposed so callers/tests can assert WHICH prediction
+     ;; mode a real encoder actually chose (see test/h264/decode_test.clj's
+     ;; multi-macroblock golden vector, which asserts this is non-DC for at
+     ;; least one MB rather than just trusting the reconstructed pixels).
+     :mb-pred-modes (mapv :pred-mode mb-states)
+     :mb-intra-chroma-pred-modes (mapv :intra-chroma-pred-mode mb-states)}))

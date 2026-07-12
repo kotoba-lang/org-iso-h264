@@ -67,9 +67,39 @@
    a SINGLE scalar applied uniformly to all 16 transformed DC values (spec
    8.5.10), using the position-(0,0) (\"both even\", group 0) LevelScale.
    Matches ffmpeg's `dequant4_coeff[p][qscale][0]` passed to
-   `ff_h264_luma_dc_dequant_idct`."
+   `ff_h264_luma_dc_dequant_idct`. Also reused (with a chroma QP, see
+   `chroma-qp`) as the chroma-DC 2x2-Hadamard dequant multiplier — ffmpeg's
+   `dequant4_coeff[chroma_idx+1][qp][0]` is built by the exact same table
+   construction as the luma one, just indexed by QPc instead of QPy."
   [qp]
   (ac-qmul qp 0 0))
+
+;; --- chroma QP derivation (§8.5.8 / Table 8-15 \"QPc as a function of
+;;     qPI\"), needed to dequantize chroma DC/AC residual with the
+;;     component's own QPc rather than the macroblock's luma QPy. ---
+
+(def qpc-table
+  "QPc as a function of qPI (already Clip3(0,51, QPY + chroma_qp_index_offset)
+   per §8.5.8) for 8-bit depth (`BitDepthC == 8`, this repo's only supported
+   depth). Identity for qPI < 30, then a compressed tail — ported 1:1 from
+   ffmpeg's `ff_h264_chroma_qp[0]` (`libavcodec/h264data.c`
+   `CHROMA_QP_TABLE_END(8)`, https://github.com/FFmpeg/FFmpeg), itself a
+   direct transcription of spec Table 8-15."
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29
+   29 30 31 32 32 33
+   34 34 35 35 36 36
+   37 37 37 38 38 38
+   39 39 39 39])
+
+(defn chroma-qp
+  "QPc (§8.5.8) for one chroma component: Clip3(0,51, QPY + qp-offset) →
+   `qpc-table` lookup. `qp-offset` is PPS `chroma_qp_index_offset` (Cb) —
+   this repo doesn't parse `second_chroma_qp_index_offset` (a High-Profile-
+   only field, see `h264.pps`), so both chroma components use the same
+   offset, matching baseline-profile streams where the two are equal
+   anyway."
+  [qpy qp-offset]
+  (nth qpc-table (max 0 (min 51 (+ qpy qp-offset)))))
 
 (defrecord H264QuantScale []
   cp-quant/QuantScale

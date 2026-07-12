@@ -139,6 +139,40 @@
              out (range 4))]
     (mapv #(nth out (* % 16)) (range 16))))
 
+(defn chroma-dc-hadamard
+  "Inverse 2x2 Hadamard transform + dequant of one ChromaArrayType 1
+   (4:2:0) chroma DC block (H.264 §8.5.8/§8.5.11). `dc-raster` is the 4 RAW
+   (NOT yet dequantized) coefficients, row-major (idx = row*2+col, i.e.
+   `[a b c d]` = top-left/top-right/bottom-left/bottom-right). No zigzag
+   unscan is needed here (unlike the luma DC/AC blocks) — `ff_h264_chroma_dc_scan`
+   (ffmpeg `libavcodec/h264data.c`) is the identity permutation for
+   ChromaArrayType 1, so `h264.cavlc/residual-block!`'s scan-order output
+   IS already raster order for this 2x2 block; see `h264.decode`. `qmul` is
+   `h264.quant/dc-qmul` applied to the
+   component's own QPc (`h264.quant/chroma-qp`) — same table construction
+   as luma, just a different QP input.
+
+   Returns a 4-element vector `[dc00 dc01 dc10 dc11]` (row-major, idx =
+   row*2+col) — the dequantized transform-domain DC coefficient to place
+   at position 0 of that quadrant's own 4x4 coefficient array before
+   calling `inverse-4x4` on it (mirrors `luma-dc-hadamard`'s per-block
+   output convention, but for chroma's 4 quadrants instead of 16 blocks).
+   Ported 1:1 from ffmpeg's `ff_h264_chroma_dc_dequant_idct_c`
+   (`libavcodec/h264idct_template.c`) — note this dequant has NO `+`
+   rounding bias before its final `>>7` (unlike the luma DC transform's
+   `+128`/`>>8`), which was verified against ffmpeg source rather than
+   assumed from the (superficially similar) luma case."
+  [dc-raster qmul]
+  (let [a (nth dc-raster 0) b (nth dc-raster 1)
+        c (nth dc-raster 2) d (nth dc-raster 3)
+        e (- a b)
+        a' (+ a b)
+        b' (- c d)
+        c' (+ c d)
+        sc (fn [v] (bit-shift-right (* v qmul) 7))]
+    [(sc (+ a' c')) (sc (+ e b'))
+     (sc (- a' c')) (sc (- e b'))]))
+
 (defrecord H264BlockTransform []
   cp-transform/BlockTransform
   (forward [_ _block]
