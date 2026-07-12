@@ -57,6 +57,7 @@
             [h264.quant :as quant]
             [h264.transform :as transform]
             [h264.intra-pred :as intra-pred]
+            [h264.interp :as interp]
             [codec-primitives.scan :as scan]))
 
 (def zigzag scan/zigzag-4x4)
@@ -514,10 +515,10 @@
   (let [mb-type (eg/ue! r)]
     (decode-intra-macroblock-body! r mb-type qp chroma-qp-index-offset left-mb top-mb topleft-mb)))
 
-;; --- P-slice inter prediction (ADR-2607122000 Migration step 7's first
-;;     increment: P_Skip + P_L0_16x16, MV=(0,0) motion compensation only —
-;;     see namespace docstring's "Pixel decode: P-slice (inter)" section
-;;     below for full scope). ---
+;; --- P-slice inter prediction (ADR-2607122000 Migration step 7:
+;;     P_Skip + P_L0_16x16, with real sub-pel/non-zero motion compensation
+;;     via h264.interp (§8.4.2.2.1/8.4.2.2.2) — see namespace docstring's
+;;     "Pixel decode: P-slice (inter)" section below for full scope). ---
 
 (defn- neighbor-mv-ref
   "[mv ref-idx] for a neighbor macroblock state `mb` (nil = unavailable),
@@ -573,64 +574,58 @@
       [0 0]
       (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0))))
 
-(defn- copy-block
-  "Copy a `size`x`size` pixel block out of flat row-major `plane` (width
-   `plane-w`) at top-left [x0 y0], as a row-vector grid — the MV=(0,0)
-   integer-pixel motion-compensation copy (no interpolation needed, see
-   namespace docstring's inter-prediction scope note)."
-  [plane plane-w x0 y0 size]
-  (vec (for [ry (range size)]
-         (vec (for [rx (range size)]
-                (nth plane (+ (* (+ y0 ry) plane-w) x0 rx)))))))
-
 (defn- mc-predict
-  "MV=(0,0) motion-compensated prediction for the macroblock at
-   (`mb-x`,`mb-y`): a direct pixel copy of `ref-frame`'s (this repo's
-   OWN previously-decoded-picture return shape, i.e. {:width :height :luma
-   :cb :cr}) co-located 16x16 luma / 8x8 Cb / 8x8 Cr blocks. Returns
-   {:luma-pred :cb-pred :cr-pred} (row-vector grids)."
-  [ref-frame mb-x mb-y]
-  (let [w (:width ref-frame) cw (quot w 2)
+  "Motion-compensated prediction for the macroblock at (`mb-x`,`mb-y`) given
+   the ALREADY-DERIVED final motion vector `mv` (quarter-luma-sample units —
+   predictor + mvd for P_L0_16x16, or the P_Skip predictor alone; see
+   `mv-predict-16x16`/`p-skip-mv`). Delegates to `h264.interp`'s luma
+   quarter-sample (§8.4.2.2.1) / chroma eighth-sample (§8.4.2.2.2)
+   interpolation — this covers MV=(0,0) as the trivial degenerate case
+   (`h264.interp/quarter-pel-luma`'s `fx=fy=0` branch is a direct sample
+   read), so no separate integer-only-MV fast path is needed. `ref-frame` is
+   this repo's OWN previously-decoded-picture return shape ({:width :height
+   :luma :cb :cr}). Returns {:luma-pred :cb-pred :cr-pred} (row-vector
+   grids)."
+  [ref-frame mb-x mb-y mv]
+  (let [w (:width ref-frame) h (:height ref-frame) cw (quot w 2) ch (quot h 2)
         lx (* mb-x 16) ly (* mb-y 16)
         cx (* mb-x 8) cy (* mb-y 8)]
-    {:luma-pred (copy-block (:luma ref-frame) w lx ly 16)
-     :cb-pred (copy-block (:cb ref-frame) cw cx cy 8)
-     :cr-pred (copy-block (:cr ref-frame) cw cx cy 8)}))
+    {:luma-pred (interp/mc-luma-block (:luma ref-frame) w h lx ly mv 16)
+     :cb-pred (interp/mc-chroma-block (:cb ref-frame) cw ch cx cy mv 8)
+     :cr-pred (interp/mc-chroma-block (:cr ref-frame) cw ch cx cy mv 8)}))
 
 (defn- decode-p-skip-macroblock!
   "Materialize one P_Skip macroblock (no bits read at all beyond the
    `mb_skip_run` the caller already consumed — see `decode-p-slice-mbs!`):
-   derive its motion vector (`p-skip-mv`), throw if it's not [0 0] (sub-
-   pel/non-zero-offset motion compensation is out of scope, see namespace
-   docstring), else motion-compensate (copy) directly with NO residual (a
-   defining property of P_Skip). `qp` is UNCHANGED from the previous
-   macroblock (P_Skip never reads `mb_qp_delta`)."
+   derive its motion vector (`p-skip-mv`), motion-compensate via
+   `mc-predict` (sub-pel-capable — see that fn's docstring, real non-(0,0)
+   motion vectors are supported) with NO residual (a defining property of
+   P_Skip). `qp` is UNCHANGED from the previous macroblock (P_Skip never
+   reads `mb_qp_delta`)."
   [qp mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
-  (let [mv (p-skip-mv left-mb top-mb topleft-mb topright-mb)]
-    (when (not= mv [0 0])
-      (throw (ex-info "h264.decode: P_Skip with a non-zero predicted motion vector is not supported (only MV=(0,0) motion compensation is implemented — sub-pel/integer-pel-offset MC is out of scope)"
-                       {:mv mv :mb-x mb-x :mb-y mb-y})))
-    (let [{:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y)]
-      {:recon luma-pred
-       :qp qp
-       :inter? true
-       :mv mv
-       :ac-nnz (vec (repeat 16 0))
-       :top-row (nth luma-pred 15)
-       :left-col (mapv #(nth % 15) luma-pred)
-       :cb {:recon cb-pred :ac-nnz (vec (repeat 4 0))
-            :top-row (nth cb-pred 7) :left-col (mapv #(nth % 7) cb-pred)}
-       :cr {:recon cr-pred :ac-nnz (vec (repeat 4 0))
-            :top-row (nth cr-pred 7) :left-col (mapv #(nth % 7) cr-pred)}})))
+  (let [mv (p-skip-mv left-mb top-mb topleft-mb topright-mb)
+        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)]
+    {:recon luma-pred
+     :qp qp
+     :inter? true
+     :mv mv
+     :ac-nnz (vec (repeat 16 0))
+     :top-row (nth luma-pred 15)
+     :left-col (mapv #(nth % 15) luma-pred)
+     :cb {:recon cb-pred :ac-nnz (vec (repeat 4 0))
+          :top-row (nth cb-pred 7) :left-col (mapv #(nth % 7) cb-pred)}
+     :cr {:recon cr-pred :ac-nnz (vec (repeat 4 0))
+          :top-row (nth cr-pred 7) :left-col (mapv #(nth % 7) cr-pred)}}))
 
 (defn- decode-inter-16x16-macroblock!
   "Decode one P_L0_16x16 macroblock (§7.3.5.1's `mb_pred`/`macroblock_layer`
    for `mb_type` 0 in a P-slice): mvd_l0 (2 se(v)) → final mv = predictor
-   (`mv-predict-16x16`) + mvd, throw unless [0 0] (see namespace docstring);
-   `coded_block_pattern` (me(v), `read-coded-block-pattern-inter!`); if any
-   residual is signaled, `mb_qp_delta`; then luma residual — 16 FULL 4x4
-   blocks (`decode-regular-block!`, maxNumCoeff 16, NOT the Intra16x16
-   DC/AC split — gated per-8x8-quadrant by `cbp-luma`'s 4 bits, see
+   (`mv-predict-16x16`) + mvd (real, possibly non-zero and/or sub-pel — see
+   `mc-predict`); `coded_block_pattern` (me(v),
+   `read-coded-block-pattern-inter!`); if any residual is signaled,
+   `mb_qp_delta`; then luma residual — 16 FULL 4x4 blocks
+   (`decode-regular-block!`, maxNumCoeff 16, NOT the Intra16x16 DC/AC split
+   — gated per-8x8-quadrant by `cbp-luma`'s 4 bits, see
    `golomb-to-inter-cbp`) — and chroma residual (reusing
    `decode-chroma-dc!`/`decode-chroma-ac-blocks!` UNCHANGED — chroma's
    DC/AC residual structure doesn't depend on the luma macroblock type,
@@ -643,14 +638,11 @@
         mvd-x (eg/se! r)
         mvd-y (eg/se! r)
         mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
-        _ (when (not= mv [0 0])
-            (throw (ex-info "h264.decode: P_L0_16x16 with a non-zero motion vector is not supported (only MV=(0,0) motion compensation is implemented — sub-pel/integer-pel-offset MC is out of scope)"
-                             {:mv mv :mvp mvp :mvd [mvd-x mvd-y] :mb-x mb-x :mb-y mb-y})))
         {:keys [cbp-luma cbp-chroma]} (read-coded-block-pattern-inter! r)
         mb-qp-delta (if (or (pos? cbp-luma) (pos? cbp-chroma)) (eg/se! r) 0)
         qp' (mod (+ qp mb-qp-delta 52) 52)
         qpc (quant/chroma-qp qp' chroma-qp-index-offset)
-        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y)
+        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)
         ac-nnz (atom (vec (repeat 16 0)))
         block-coeffs
         (mapv
@@ -872,14 +864,14 @@
 (defn decode-gop
   "Decode ALL pictures in `annexb-bytes` (an Annex B elementary stream,
    e.g. a whole GOP: one IDR I-frame followed by zero or more P-frames) in
-   bitstream order — ADR-2607122000 Migration step 7's first increment
-   (P_Skip + P_L0_16x16 inter prediction, MV=(0,0) motion compensation
-   only, single reference frame — see namespace docstring's \"Pixel
-   decode: P-slice (inter)\" section). Each P-frame's inter prediction
-   references the IMMEDIATELY PRECEDING decoded picture as its single
-   reference frame (`h264.slice` requires `num_ref_idx_l0_active == 1`,
-   throwing otherwise — a real multi-frame reference-picture buffer/DPB is
-   out of scope).
+   bitstream order — ADR-2607122000 Migration step 7 (P_Skip + P_L0_16x16
+   inter prediction, REAL sub-pel/non-zero motion compensation via
+   `h264.interp`, single reference frame — see namespace docstring's
+   \"Pixel decode: P-slice (inter)\" section). Each P-frame's inter
+   prediction references the IMMEDIATELY PRECEDING decoded picture as its
+   single reference frame (`h264.slice` requires `num_ref_idx_l0_active ==
+   1`, throwing otherwise — a real multi-frame reference-picture buffer/DPB
+   is out of scope).
 
    A single SPS/PPS pair (the first of each found in the whole stream) is
    assumed to apply to every picture — matches real encoders, which
