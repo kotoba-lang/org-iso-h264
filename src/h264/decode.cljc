@@ -769,82 +769,263 @@
 
 ;; --- P-slice inter prediction (ADR-2607122000 Migration step 7:
 ;;     P_Skip + P_L0_16x16, with real sub-pel/non-zero motion compensation
-;;     via h264.interp (§8.4.2.2.1/8.4.2.2.2) — see namespace docstring's
-;;     "Pixel decode: P-slice (inter)" section below for full scope). ---
+;;     via h264.interp (§8.4.2.2.1/8.4.2.2.2); Migration step 7's
+;;     sub-partition increment adds P_16x8/P_8x16/P_8x8 (sub_mb_type
+;;     P_L0_8x8 only) below — see namespace docstring's "Pixel decode:
+;;     P-slice (inter)" section below for full scope). ---
 
-(defn- neighbor-mv-ref
-  "[mv ref-idx] for a neighbor macroblock state `mb` (nil = unavailable),
-   per §8.4.1.3's convention: an unavailable OR intra-coded neighbor
-   contributes mv=[0 0] and ref-idx=-1 (never equal to a real ref-idx,
-   which is always 0 in this repo's single-reference-frame scope) — intra
-   macroblocks are NOT motion-compensated candidates, spec-mandated."
-  [mb]
-  (if (and mb (:inter? mb)) [(:mv mb) 0] [[0 0] -1]))
+(defn- mvf [mv ref-idx] {:mv mv :ref-idx ref-idx})
+
+(defn- uniform-mv-field
+  "A 4-quadrant `:mv-field` (TL/TR/BL/BR, quadrant idx = qcol + 2*qrow) where
+   every quadrant shares the SAME `mv`/ref-idx 0 — the shape every
+   whole-16x16-partition inter mb_type (`P_Skip`/`P_L0_16x16`) carries, so
+   sub-partition-aware neighbor derivation (`mb-quadrant-mv` below) can treat
+   ALL inter macroblocks uniformly regardless of whether they're actually
+   sub-partitioned."
+  [mv]
+  (vec (repeat 4 (mvf mv 0))))
+
+(defn- mv-field->vec
+  "Convert a fully-decided `own-mv-field` map (quadrant-idx -> {:mv
+   :ref-idx}, built up by `read-partition-mv!` across a macroblock's
+   partitions — see `decode-inter-16x8-macroblock!`/
+   `decode-inter-8x16-macroblock!`/`decode-inter-8x8-macroblock!`) into the
+   4-element VECTOR shape (index = quadrant-idx) every macroblock state's
+   `:mv-field` key uses (matching `uniform-mv-field`'s own return shape, so
+   `mb-quadrant-mv`'s `(nth (:mv-field mb) q)` works identically regardless
+   of whether the neighbor was a whole-16x16 partition or sub-partitioned)."
+  [m]
+  (mapv #(get m %) (range 4)))
 
 (defn- median3 [a b c] (- (+ a b c) (min a b c) (max a b c)))
 
-(defn- mv-predict-16x16
-  "Median luma motion vector prediction (§8.4.1.3) for a 16x16 partition,
-   given this repo's single-reference-frame simplification (`cur-ref-idx`
-   is always 0). `left-mb`/`top-mb` are the A/B neighbor MB states (nil if
-   unavailable); `topleft-mb`/`topright-mb` are the D/C neighbors — C
-   (top-right) is used when available, else D (top-left) is substituted
-   per spec's `mbAddrC` unavailability rule. Returns [mvx mvy] (quarter-
-   luma-sample units)."
-  [left-mb top-mb topleft-mb topright-mb cur-ref-idx]
-  (let [c-mb (or topright-mb topleft-mb)
-        [mvA refA] (neighbor-mv-ref left-mb)
-        [mvB0 refB0] (neighbor-mv-ref top-mb)
-        [mvC0 refC0] (neighbor-mv-ref c-mb)
-        ;; §8.4.1.3: when B and C are BOTH unavailable and A is available,
-        ;; B and C are each set equal to A (not left as unavailable/zero).
-        both-unavail? (and (nil? top-mb) (nil? c-mb))
-        [mvB refB mvC refC] (if (and both-unavail? left-mb)
-                               [mvA refA mvA refA]
-                               [mvB0 refB0 mvC0 refC0])
-        cands [[mvA refA] [mvB refB] [mvC refC]]
-        exact-matches (filter #(= cur-ref-idx (second %)) cands)]
+(defn- mb-quadrant-mv
+  "{:mv :ref-idx} for neighbor macroblock state `mb` (nil = unavailable) at
+   8x8-quadrant index `q` (0=TL,1=TR,2=BL,3=BR = qcol + 2*qrow), per
+   §8.4.1.3.2's neighbouring-partition availability rule: an unavailable
+   MB address, an intra-coded MB, or (this repo's single-reference/no-
+   B-slice scope) any non-predFlag partition all uniformly contribute
+   ref-idx -1 / mv [0 0] — intra macroblocks are NOT motion-compensated
+   candidates, spec-mandated. Cross-checked against FFmpeg's
+   `mb-quadrant-mv`-equivalent neighbour reads in `pred_motion`/
+   `pred_pskip_motion` (`libavcodec/h264_mvpred.h`), which likewise always
+   address a SPECIFIC 4x4/8x8 sub-position of a neighbor MB rather than
+   treating the whole neighbor as one value — this only produces a
+   DIFFERENT result than reading a flat per-MB `:mv` once a neighbor is
+   itself sub-partitioned (`P_16x8`/`P_8x16`/`P_8x8`, see below), since
+   every mb_type this repo supported BEFORE this increment has a uniform
+   `:mv-field` (`uniform-mv-field`) where every quadrant already agrees."
+  [mb q]
+  (if (and mb (:inter? mb)) (nth (:mv-field mb) q) (mvf [0 0] -1)))
+
+(defn- classify-4x4
+  "(bx4,by4) — 4x4-luma-block-unit offsets relative to the CURRENT
+   macroblock's top-left corner, each in -1..4 — -> [slot quadrant-idx],
+   where slot is :self/:left/:top/:topleft/:topright/:none. :none means the
+   target macroblock address does NOT exist yet in raster-scan decode
+   order: the ONLY case reachable in this repo's scope is (4,by) with
+   by in 0..3 (same picture ROW, one macroblock to the right of current —
+   raster order hasn't decoded it yet). This must be distinguished from a
+   neighbor that EXISTS but is intra-coded (which contributes ref-idx -1
+   directly via `mb-quadrant-mv`, WITHOUT the §8.4.1.3.1 mbAddrC->mbAddrD
+   substitution `neighbor-abc` performs only for :none) — cross-checked
+   against FFmpeg's `fetch_diagonal_mv` (`libavcodec/h264_mvpred.h`), whose
+   `topright_ref != PART_NOT_AVAILABLE` substitution guard is keyed on
+   MACROBLOCK-ADDRESS availability, not on the neighbor's intra/inter-ness."
+  [bx4 by4]
+  (cond
+    (and (<= 0 bx4 3) (<= 0 by4 3)) [:self (+ (quot bx4 2) (* 2 (quot by4 2)))]
+    (and (= bx4 -1) (<= 0 by4 3)) [:left (+ 1 (* 2 (quot by4 2)))]
+    (and (<= 0 bx4 3) (= by4 -1)) [:top (+ (quot bx4 2) 2)]
+    (and (= bx4 -1) (= by4 -1)) [:topleft 3]
+    (and (= bx4 4) (= by4 -1)) [:topright 2]
+    :else [:none -1]))
+
+(defn- slot-value
+  [slot q own-mv-field left-mb top-mb topleft-mb topright-mb]
+  (case slot
+    :self (get own-mv-field q (mvf [0 0] -1))
+    :none (mvf [0 0] -1)
+    :left (mb-quadrant-mv left-mb q)
+    :top (mb-quadrant-mv top-mb q)
+    :topleft (mb-quadrant-mv topleft-mb q)
+    :topright (mb-quadrant-mv topright-mb q)))
+
+(defn- slot-addr-exists?
+  [slot left-mb top-mb topleft-mb topright-mb]
+  (case slot
+    :self true
+    :none false
+    :left (some? left-mb)
+    :top (some? top-mb)
+    :topleft (some? topleft-mb)
+    :topright (some? topright-mb)))
+
+(defn- neighbor-abc
+  "General §8.4.1.3.1 A/B/C derivation (with the mbAddrC -> mbAddrD
+   substitution) for a partition at 4x4-luma-block-unit position (x4,y4)
+   size (w4,h4) — x4,y4 in #{0,2}, w4,h4 in #{2,4} for every partition
+   shape this repo supports (16x16/16x8/8x16/8x8). `own-mv-field` is a
+   PARTIAL map (quadrant-idx -> {:mv :ref-idx}) of THIS macroblock's own
+   already-decided partitions (earlier in the fixed TL/TR/BL/BR decode
+   order §7.3.5.2's `sub_mb_pred`/§7.4.5.2's mbPartIdx order both use) —
+   always sufficient for any A/B/C that lands inside the CURRENT macroblock
+   given these 4 shapes: A and B, when internal, always reference an
+   EARLIER quadrant in that order; the one same-row 'C would need a
+   not-yet-decided same-MB quadrant' case (BR's C) instead lands ONE COLUMN
+   PAST the macroblock's own right edge — i.e. :none, not :self, via
+   `classify-4x4` — never a genuine same-MB forward reference. `_h4` (the
+   partition's own height) is accepted for call-site symmetry with
+   `mv-predict-partition` but genuinely unused here — A/B/C's positions
+   only ever depend on a partition's TOP-LEFT corner and WIDTH (never its
+   height), matching FFmpeg's own `pred_motion`/`fetch_diagonal_mv`, whose
+   analogous helpers likewise take no height parameter."
+  [own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 _h4]
+  (let [[slotA qA] (classify-4x4 (dec x4) y4)
+        [slotB qB] (classify-4x4 x4 (dec y4))
+        [slotC0 qC0] (classify-4x4 (+ x4 w4) (dec y4))
+        c-exists? (slot-addr-exists? slotC0 left-mb top-mb topleft-mb topright-mb)
+        [slotC qC] (if c-exists? [slotC0 qC0] (classify-4x4 (dec x4) (dec y4)))]
+    {:A (slot-value slotA qA own-mv-field left-mb top-mb topleft-mb topright-mb)
+     :B (slot-value slotB qB own-mv-field left-mb top-mb topleft-mb topright-mb)
+     :C (slot-value slotC qC own-mv-field left-mb top-mb topleft-mb topright-mb)}))
+
+(defn- median-mv-predict
+  "General §8.4.1.3.1 median motion-vector predictor over an already-derived
+   {:A :B :C} neighbor map (`neighbor-abc`), given this repo's single-
+   reference-frame simplification (`cur-ref-idx` is always 0). NOTE: this
+   intentionally omits the spec's additional 'B and C both address-
+   unavailable, A available -> B=C=A' substitution — in this repo's
+   single-reference-frame scope (every real inter neighbor's ref-idx is
+   ALWAYS 0, so 'available' and 'ref-idx matches' are the same condition)
+   that substitution is PROVABLY REDUNDANT: without it, an available-but-
+   unmatched-neighbor-starved A still ends up the sole `exact-matches` hit
+   below whenever B and C are both unavailable, producing the IDENTICAL
+   [mvA] result the substitution would have forced via median(A,A,A)=A —
+   verified against FFmpeg's `pred_motion` (`libavcodec/h264_mvpred.h`),
+   whose OWN analogous `match_count==0` special case is similarly
+   unreachable outside multi-reference-frame streams."
+  [{:keys [A B C]} cur-ref-idx]
+  (let [cands [A B C]
+        exact-matches (filter #(= cur-ref-idx (:ref-idx %)) cands)]
     (if (= 1 (count exact-matches))
-      ;; exactly one neighbor's ref-idx matches the current one: use ITS mv
-      ;; directly (not the median) — §8.4.1.3.1.
-      (first (first exact-matches))
-      [(median3 (nth mvA 0) (nth mvB 0) (nth mvC 0))
-       (median3 (nth mvA 1) (nth mvB 1) (nth mvC 1))])))
+      (:mv (first exact-matches))
+      [(median3 (get-in A [:mv 0]) (get-in B [:mv 0]) (get-in C [:mv 0]))
+       (median3 (get-in A [:mv 1]) (get-in B [:mv 1]) (get-in C [:mv 1]))])))
+
+(defn- mv-predict-partition
+  "General §8.4.1.3 luma motion-vector predictor for a partition at
+   4x4-luma-block-unit position (x4,y4) size (w4,h4). Dispatches to the
+   16x8/8x16 directional special cases (§8.4.1.3's own mbPartIdx-conditioned
+   bullet list: use ONE named neighbor directly when its ref-idx matches,
+   else fall through) before falling back to the general median process
+   (§8.4.1.3.1, `median-mv-predict`) shared by whole-16x16 partitions AND
+   every 8x8 sub-partition alike. Cross-checked against FFmpeg's
+   `pred_16x8_motion`/`pred_8x16_motion`/`pred_motion`
+   (`libavcodec/h264_mvpred.h`)."
+  [own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4 cur-ref-idx]
+  (let [abc (neighbor-abc own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4)]
+    (cond
+      (and (= w4 4) (= h4 2) (zero? y4)) ; P_16x8 top partition
+      (if (= cur-ref-idx (:ref-idx (:B abc))) (:mv (:B abc)) (median-mv-predict abc cur-ref-idx))
+
+      (and (= w4 4) (= h4 2) (= y4 2)) ; P_16x8 bottom partition
+      (if (= cur-ref-idx (:ref-idx (:A abc))) (:mv (:A abc)) (median-mv-predict abc cur-ref-idx))
+
+      (and (= w4 2) (= h4 4) (zero? x4)) ; P_8x16 left partition
+      (if (= cur-ref-idx (:ref-idx (:A abc))) (:mv (:A abc)) (median-mv-predict abc cur-ref-idx))
+
+      (and (= w4 2) (= h4 4) (= x4 2)) ; P_8x16 right partition
+      (if (= cur-ref-idx (:ref-idx (:C abc))) (:mv (:C abc)) (median-mv-predict abc cur-ref-idx))
+
+      :else (median-mv-predict abc cur-ref-idx)))) ; 16x16 whole MB, or any 8x8 sub-partition
+
+(defn- mv-predict-16x16
+  "Median luma motion vector prediction (§8.4.1.3) for a whole-macroblock
+   16x16 partition — the degenerate case of `mv-predict-partition` at
+   (x4=0,y4=0,w4=4,h4=4), which always dispatches straight to
+   `median-mv-predict` (16x8/8x16's special cases never match a full-width-
+   and-height partition). `left-mb`/`top-mb` are the A/B neighbor MB states
+   (nil if unavailable); `topleft-mb`/`topright-mb` are the D/C neighbors.
+   Returns [mvx mvy] (quarter-luma-sample units)."
+  [left-mb top-mb topleft-mb topright-mb cur-ref-idx]
+  (mv-predict-partition {} left-mb top-mb topleft-mb topright-mb 0 0 4 4 cur-ref-idx))
 
 (defn- p-skip-mv
   "Predicted (and, for P_Skip, FINAL — no mvd is ever coded for P_Skip)
    motion vector for a P_Skip macroblock, per §8.4.1.1: [0 0] if the left
    or top neighbor is unavailable, or if either has ref-idx 0 and mv
    [0 0] already; otherwise the general median predictor (§8.4.1.3)
-   applies."
+   applies. Reads the SAME quadrants (`mb-quadrant-mv`, TR-of-left/BL-of-top)
+   the general predictor's own A/B would use for a 16x16 partition — cross-
+   checked against FFmpeg's `pred_pskip_motion` (`libavcodec/h264_mvpred.h`),
+   which likewise addresses those specific quadrants rather than a flat
+   per-MB value."
   [left-mb top-mb topleft-mb topright-mb]
-  (let [[mvA refA] (neighbor-mv-ref left-mb)
-        [mvB refB] (neighbor-mv-ref top-mb)]
+  (let [{mvA :mv refA :ref-idx} (mb-quadrant-mv left-mb 1)
+        {mvB :mv refB :ref-idx} (mb-quadrant-mv top-mb 2)]
     (if (or (nil? left-mb) (nil? top-mb)
             (and (= refA 0) (= mvA [0 0]))
             (and (= refB 0) (= mvB [0 0])))
       [0 0]
       (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0))))
 
+(defn- place-subgrid
+  "Place a `size`x`size` sub-grid `sub` into a larger row-vector grid `acc`
+   at quadrant-unit offset (`qc`,`qr`) — i.e. pixel offset (`qc`*size,
+   `qr`*size)."
+  [acc qr qc size sub]
+  (reduce (fn [acc ry]
+            (reduce (fn [acc rx]
+                      (assoc-in acc [(+ (* qr size) ry) (+ (* qc size) rx)] (get-in sub [ry rx])))
+                    acc (range size)))
+          acc (range size)))
+
+(defn- mc-predict-quadrants
+  "Motion-compensated prediction for the macroblock at (`mb-x`,`mb-y`),
+   given a per-8x8-quadrant motion vector via `quad-mv` (a fn of [qcol qrow]
+   -> mv, quadrant coords each 0/1). Generalizes the single-mv 16x16 case to
+   `P_16x8`/`P_8x16`/`P_8x8` macroblocks, whose 4 8x8 quadrants may each
+   carry a DIFFERENT motion vector — built from 4 independent 8x8-luma/
+   4x4-chroma `h264.interp` calls. Motion compensation is a PURE per-pixel
+   function of (position, that pixel's own partition's mv) — decomposing
+   ANY of the 4 supported partition shapes into 4 uniform 8x8-quadrant calls
+   (even when 2 or 4 of them happen to share the SAME mv, as for
+   `P_16x8`/`P_8x16`/`P_L0_16x16`) produces PIXEL-IDENTICAL results to a
+   single larger-block call — no `h264.interp` changes needed, and this is
+   also how the plain 16x16 case is implemented now (`mc-predict` below)."
+  [ref-frame mb-x mb-y quad-mv]
+  (let [w (:width ref-frame) h (:height ref-frame) cw (quot w 2) ch (quot h 2)
+        lx (* mb-x 16) ly (* mb-y 16)
+        cx (* mb-x 8) cy (* mb-y 8)
+        quads (for [qr [0 1] qc [0 1]] [qc qr])
+        luma (reduce (fn [g [qc qr]]
+                       (place-subgrid g qr qc 8
+                                      (interp/mc-luma-block (:luma ref-frame) w h (+ lx (* qc 8)) (+ ly (* qr 8)) (quad-mv qc qr) 8)))
+                     (vec (repeat 16 (vec (repeat 16 0)))) quads)
+        cb (reduce (fn [g [qc qr]]
+                     (place-subgrid g qr qc 4
+                                    (interp/mc-chroma-block (:cb ref-frame) cw ch (+ cx (* qc 4)) (+ cy (* qr 4)) (quad-mv qc qr) 4)))
+                   (vec (repeat 8 (vec (repeat 8 0)))) quads)
+        cr (reduce (fn [g [qc qr]]
+                     (place-subgrid g qr qc 4
+                                    (interp/mc-chroma-block (:cr ref-frame) cw ch (+ cx (* qc 4)) (+ cy (* qr 4)) (quad-mv qc qr) 4)))
+                   (vec (repeat 8 (vec (repeat 8 0)))) quads)]
+    {:luma-pred luma :cb-pred cb :cr-pred cr}))
+
 (defn- mc-predict
   "Motion-compensated prediction for the macroblock at (`mb-x`,`mb-y`) given
    the ALREADY-DERIVED final motion vector `mv` (quarter-luma-sample units —
    predictor + mvd for P_L0_16x16, or the P_Skip predictor alone; see
-   `mv-predict-16x16`/`p-skip-mv`). Delegates to `h264.interp`'s luma
-   quarter-sample (§8.4.2.2.1) / chroma eighth-sample (§8.4.2.2.2)
-   interpolation — this covers MV=(0,0) as the trivial degenerate case
-   (`h264.interp/quarter-pel-luma`'s `fx=fy=0` branch is a direct sample
-   read), so no separate integer-only-MV fast path is needed. `ref-frame` is
-   this repo's OWN previously-decoded-picture return shape ({:width :height
-   :luma :cb :cr}). Returns {:luma-pred :cb-pred :cr-pred} (row-vector
-   grids)."
+   `mv-predict-16x16`/`p-skip-mv`). The single-mv degenerate case of
+   `mc-predict-quadrants` (see that fn's docstring for why decomposing into
+   4 uniform-mv 8x8 quadrant calls is pixel-identical to one 16x16 call).
+   `ref-frame` is this repo's OWN previously-decoded-picture return shape
+   ({:width :height :luma :cb :cr}). Returns {:luma-pred :cb-pred :cr-pred}
+   (row-vector grids)."
   [ref-frame mb-x mb-y mv]
-  (let [w (:width ref-frame) h (:height ref-frame) cw (quot w 2) ch (quot h 2)
-        lx (* mb-x 16) ly (* mb-y 16)
-        cx (* mb-x 8) cy (* mb-y 8)]
-    {:luma-pred (interp/mc-luma-block (:luma ref-frame) w h lx ly mv 16)
-     :cb-pred (interp/mc-chroma-block (:cb ref-frame) cw ch cx cy mv 8)
-     :cr-pred (interp/mc-chroma-block (:cr ref-frame) cw ch cx cy mv 8)}))
+  (mc-predict-quadrants ref-frame mb-x mb-y (fn [_ _] mv)))
 
 (defn- decode-p-skip-macroblock!
   "Materialize one P_Skip macroblock (no bits read at all beyond the
@@ -861,6 +1042,8 @@
      :qp qp
      :inter? true
      :mv mv
+     :mv-field (uniform-mv-field mv)
+     :sub-type :p-skip
      :ac-nnz (vec (repeat 16 0))
      :top-row (nth luma-pred 15)
      :left-col (mapv #(nth % 15) luma-pred)
@@ -869,32 +1052,30 @@
      :cr {:recon cr-pred :ac-nnz (vec (repeat 4 0))
           :top-row (nth cr-pred 7) :left-col (mapv #(nth % 7) cr-pred)}}))
 
-(defn- decode-inter-16x16-macroblock!
-  "Decode one P_L0_16x16 macroblock (§7.3.5.1's `mb_pred`/`macroblock_layer`
-   for `mb_type` 0 in a P-slice): mvd_l0 (2 se(v)) → final mv = predictor
-   (`mv-predict-16x16`) + mvd (real, possibly non-zero and/or sub-pel — see
-   `mc-predict`); `coded_block_pattern` (me(v),
-   `read-coded-block-pattern-inter!`); if any residual is signaled,
-   `mb_qp_delta`; then luma residual — 16 FULL 4x4 blocks
-   (`decode-regular-block!`, maxNumCoeff 16, NOT the Intra16x16 DC/AC split
-   — gated per-8x8-quadrant by `cbp-luma`'s 4 bits, see
-   `golomb-to-inter-cbp`) — and chroma residual (reusing
-   `decode-chroma-dc!`/`decode-chroma-ac-blocks!` UNCHANGED — chroma's
-   DC/AC residual structure doesn't depend on the luma macroblock type,
-   see README). Reference-frame ref_idx is implicitly 0 (this repo
-   requires num_ref_idx_l0_active == 1, see `h264.slice`), so no ref_idx
-   is read (matches spec's `if (num_ref_idx_l0_active_minus1 > 0) ...`
-   gate)."
-  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
-  (let [mvp (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0)
-        mvd-x (eg/se! r)
-        mvd-y (eg/se! r)
-        mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
+(defn- decode-inter-residual-and-reconstruct!
+  "Shared §7.3.5.1 macroblock_layer() TAIL — `coded_block_pattern` (me(v),
+   `read-coded-block-pattern-inter!`) → (if any residual is signaled)
+   `mb_qp_delta` → luma residual (16 FULL 4x4 blocks, `decode-regular-block!`,
+   maxNumCoeff 16, NOT the Intra16x16 DC/AC split — gated per-8x8-quadrant
+   by `cbp-luma`'s 4 bits, see `golomb-to-inter-cbp`) → chroma residual
+   (`decode-chroma-dc!`/`decode-chroma-ac-blocks!`, UNCHANGED — chroma's
+   DC/AC residual structure doesn't depend on the luma macroblock type OR
+   its partitioning, see README) → pixel reconstruction — for EVERY inter
+   mb_type this repo supports: `P_L0_16x16`/`P_16x8`/`P_8x16`/`P_8x8` all
+   share this EXACT syntax and semantics, since `coded_block_pattern` and
+   `residual()` don't depend on the partition structure above them at all,
+   only on the already-fully-derived per-8x8-quadrant motion-compensated
+   prediction `mc` (see `mc-predict`/`mc-predict-quadrants`). `mv-field` is
+   this MB's own already-fully-decided per-quadrant `{:mv :ref-idx}` vector
+   (returned verbatim as this state's `:mv-field`, consumed by the NEXT
+   macroblock's own `mv-predict-partition` neighbor derivation, see
+   `mb-quadrant-mv`)."
+  [r qp chroma-qp-index-offset left-mb top-mb mv-field mc]
+  (let [{:keys [luma-pred cb-pred cr-pred]} mc
         {:keys [cbp-luma cbp-chroma]} (read-coded-block-pattern-inter! r)
         mb-qp-delta (if (or (pos? cbp-luma) (pos? cbp-chroma)) (eg/se! r) 0)
         qp' (mod (+ qp mb-qp-delta 52) 52)
         qpc (quant/chroma-qp qp' chroma-qp-index-offset)
-        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)
         ac-nnz (atom (vec (repeat 16 0)))
         block-coeffs
         (mapv
@@ -926,33 +1107,160 @@
     {:recon recon
      :qp qp'
      :inter? true
-     :mv mv
+     :mv-field mv-field
+     ;; Legacy single-mv reporting key — the TL quadrant's mv for a
+     ;; sub-partitioned mb_type (P_16x8/P_8x16/P_8x8 may carry DIFFERENT
+     ;; mvs per quadrant; see `:mv-field`/`:sub-type` for the real
+     ;; per-partition data, exposed via `decode-picture`'s `:mb-mv-fields`/
+     ;; `:mb-sub-types`) — identical to the whole-MB mv for P_L0_16x16.
+     :mv (:mv (nth mv-field 0))
      :ac-nnz @ac-nnz
      :top-row (nth recon 15)
      :left-col (mapv #(nth % 15) recon)
      :cb {:recon cb-recon :ac-nnz cb-ac-nnz :top-row (nth cb-recon 7) :left-col (mapv #(nth % 7) cb-recon)}
      :cr {:recon cr-recon :ac-nnz cr-ac-nnz :top-row (nth cr-recon 7) :left-col (mapv #(nth % 7) cr-recon)}}))
 
+(defn- decode-inter-16x16-macroblock!
+  "Decode one P_L0_16x16 macroblock (§7.3.5.1's `mb_pred`/`macroblock_layer`
+   for `mb_type` 0 in a P-slice): mvd_l0 (2 se(v)) → final mv = predictor
+   (`mv-predict-16x16`) + mvd (real, possibly non-zero and/or sub-pel — see
+   `mc-predict`) → shared residual/reconstruction tail
+   (`decode-inter-residual-and-reconstruct!`). Reference-frame ref_idx is
+   implicitly 0 (this repo requires num_ref_idx_l0_active == 1, see
+   `h264.slice`), so no ref_idx is read (matches spec's
+   `if (num_ref_idx_l0_active_minus1 > 0) ...` gate)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [mvp (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0)
+        mvd-x (eg/se! r)
+        mvd-y (eg/se! r)
+        mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
+        mc (mc-predict ref-frame mb-x mb-y mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (uniform-mv-field mv) mc)]
+    (assoc state :sub-type :p-l0-16x16)))
+
+;; --- P-slice sub-partitioned inter prediction (ADR-2607122000 Migration
+;;     step 7's sub-partition increment): P_16x8/P_8x16 (mb_type 1/2, two
+;;     16x8 or 8x16 partitions, each with its own motion vector) and P_8x8
+;;     (mb_type 3, four 8x8 partitions) — but, for P_8x8, ONLY sub_mb_type
+;;     P_L0_8x8 (no further split within an 8x8 partition; sub_mb_type
+;;     1/2/3 = P_L0_8x4/P_L0_4x8/P_L0_4x4 throw explicitly, matching this
+;;     repo's throw-on-unsupported discipline). `mb_type` 4 (P_8x8ref0)
+;;     ALSO throws — this repo's single-reference-frame scope
+;;     (num_ref_idx_l0_active == 1) makes P_8x8ref0's bitstream syntax
+;;     IDENTICAL to plain P_8x8's (ref_idx_l0 is never present in the
+;;     bitstream either way, since it's only signaled when
+;;     num_ref_idx_l0_active_minus1 > 0), but it's excluded from THIS
+;;     increment's scope regardless, per the calling task's own scope
+;;     decision — see README for the exact narrative. ---
+
+(defn- read-partition-mv!
+  "Read one partition's `mvd_l0` (2 se(v)) and derive its final motion
+   vector (`mv-predict-partition` + mvd), threading `own-mv-field` forward:
+   this partition's OWN quadrants (`quadrants`, a seq of quadrant indices it
+   covers) are assoc'd into the returned map, ready for a LATER same-MB
+   partition's own A/B/C neighbor derivation (`neighbor-abc`). Returns
+   [mv own-mv-field']."
+  [r own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4 quadrants]
+  (let [mvp (mv-predict-partition own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4 0)
+        mvd-x (eg/se! r)
+        mvd-y (eg/se! r)
+        mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
+        own-mv-field' (reduce (fn [m q] (assoc m q (mvf mv 0))) own-mv-field quadrants)]
+    [mv own-mv-field']))
+
+(defn- decode-inter-16x8-macroblock!
+  "Decode one P_L0_L0_16x8 macroblock (`mb_type` 1 in a P-slice): 2
+   horizontal 16x8 partitions (top = quadrants TL+TR, bottom = quadrants
+   BL+BR), each with its own `mvd_l0` — read in mbPartIdx order (top then
+   bottom, §7.3.5.1's `mb_pred` loop order) — then the SAME
+   `coded_block_pattern`/residual/reconstruction tail every inter mb_type
+   uses (`decode-inter-residual-and-reconstruct!`)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [[mv-top f1] (read-partition-mv! r {} left-mb top-mb topleft-mb topright-mb 0 0 4 2 [0 1])
+        [mv-bot mv-field] (read-partition-mv! r f1 left-mb top-mb topleft-mb topright-mb 0 2 4 2 [2 3])
+        quad-mv (fn [_qc qr] (if (zero? qr) mv-top mv-bot))
+        mc (mc-predict-quadrants ref-frame mb-x mb-y quad-mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (mv-field->vec mv-field) mc)]
+    (assoc state :sub-type :p-16x8)))
+
+(defn- decode-inter-8x16-macroblock!
+  "Decode one P_L0_L0_8x16 macroblock (`mb_type` 2 in a P-slice): 2 vertical
+   8x16 partitions (left = quadrants TL+BL, right = quadrants TR+BR), each
+   with its own `mvd_l0` — read in mbPartIdx order (left then right) — then
+   the shared residual/reconstruction tail
+   (`decode-inter-residual-and-reconstruct!`)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [[mv-left f1] (read-partition-mv! r {} left-mb top-mb topleft-mb topright-mb 0 0 2 4 [0 2])
+        [mv-right mv-field] (read-partition-mv! r f1 left-mb top-mb topleft-mb topright-mb 2 0 2 4 [1 3])
+        quad-mv (fn [qc _qr] (if (zero? qc) mv-left mv-right))
+        mc (mc-predict-quadrants ref-frame mb-x mb-y quad-mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (mv-field->vec mv-field) mc)]
+    (assoc state :sub-type :p-8x16)))
+
+(defn- decode-inter-8x8-macroblock!
+  "Decode one P_8x8 macroblock (`mb_type` 3 in a P-slice): §7.3.5.2
+   `sub_mb_pred` reads all 4 `sub_mb_type` values FIRST (mbPartIdx 0..3,
+   TL/TR/BL/BR raster order — matching this repo's quadrant convention
+   throughout), THEN (since this repo's `num_ref_idx_l0_active == 1`
+   requirement means `ref_idx_l0` is NEVER present in the bitstream — the
+   SAME simplification `P_L0_16x16`/`P_16x8`/`P_8x16` already rely on)
+   loops `mvd_l0` per sub-macroblock-partition. ONLY `sub_mb_type`
+   P_L0_8x8 (value 0 — one 8x8 partition per quadrant, no further split)
+   is supported: any OTHER sub_mb_type (P_L0_8x4/P_L0_4x8/P_L0_4x4 — 1/2/
+   3) throws explicitly rather than being silently mis-decoded, matching
+   this repo's existing throw-on-unsupported discipline. Given that
+   constraint, each of the 4 quadrants has exactly ONE sub-partition MV,
+   read in the SAME TL/TR/BL/BR order the residual/mv-field machinery
+   already assumes throughout this namespace."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [sub-mb-types (mapv (fn [_] (eg/ue! r)) (range 4))
+        _ (when (some #(not= 0 %) sub-mb-types)
+            (throw (ex-info "h264.decode: only sub_mb_type P_L0_8x8 (0) is supported for P_8x8 macroblocks — P_L0_8x4/P_L0_4x8/P_L0_4x4 (further-subdivided 8x8 partitions) are out of scope"
+                             {:sub-mb-types sub-mb-types})))
+        [mv0 f1] (read-partition-mv! r {} left-mb top-mb topleft-mb topright-mb 0 0 2 2 [0])
+        [mv1 f2] (read-partition-mv! r f1 left-mb top-mb topleft-mb topright-mb 2 0 2 2 [1])
+        [mv2 f3] (read-partition-mv! r f2 left-mb top-mb topleft-mb topright-mb 0 2 2 2 [2])
+        [mv3 mv-field] (read-partition-mv! r f3 left-mb top-mb topleft-mb topright-mb 2 2 2 2 [3])
+        mvs [mv0 mv1 mv2 mv3]
+        quad-mv (fn [qc qr] (nth mvs (+ qc (* 2 qr))))
+        mc (mc-predict-quadrants ref-frame mb-x mb-y quad-mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (mv-field->vec mv-field) mc)]
+    (assoc state :sub-type :p-8x8)))
+
 (defn- decode-macroblock-p!
   "Decode one macroblock from a P-slice (`macroblock_layer()` after the
    caller has already handled `mb_skip_run` — see `decode-p-slice-mbs!`).
    Reads `mb_type` (P-slice numbering, Table 7-13): 0 = P_L0_16x16
-   (`decode-inter-16x16-macroblock!`); 1/2/3/4 = P_L0_L0_16x8/P_L0_L0_8x16/
-   P_8x8/P_8x8ref0 (sub-partitioned motion — OUT OF SCOPE, throws
-   explicitly rather than mis-decoding, matching this repo's existing
-   throw-on-unsupported-mb_type discipline, see `i16x16-mb-info`); >=5 =
-   intra macroblock, `intra_mb_type = p_mb_type - 5` (Table 7-13's own
-   offset), delegated to `decode-intra-macroblock-body!` (same intra
-   decode path an I-slice would use — a P-slice's intra-coded macroblocks
-   are pixel-identical to an I-slice's, see that fn's docstring)."
+   (`decode-inter-16x16-macroblock!`); 1 = P_L0_L0_16x8
+   (`decode-inter-16x8-macroblock!`); 2 = P_L0_L0_8x16
+   (`decode-inter-8x16-macroblock!`); 3 = P_8x8, sub_mb_type P_L0_8x8 ONLY
+   (`decode-inter-8x8-macroblock!` — throws for any OTHER sub_mb_type); 4 =
+   P_8x8ref0 — OUT OF SCOPE, throws explicitly (this repo's
+   single-reference-frame requirement makes its bitstream syntax identical
+   to plain P_8x8's, but it's excluded from this increment's scope
+   regardless, matching this repo's existing throw-on-unsupported-mb_type
+   discipline, see `i16x16-mb-info`); >=5 = intra macroblock,
+   `intra_mb_type = p_mb_type - 5` (Table 7-13's own offset), delegated to
+   `decode-intra-macroblock-body!` (same intra decode path an I-slice would
+   use — a P-slice's intra-coded macroblocks are pixel-identical to an
+   I-slice's, see that fn's docstring)."
   [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
   (let [p-mb-type (eg/ue! r)]
     (cond
       (zero? p-mb-type)
       (decode-inter-16x16-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
 
-      (contains? #{1 2 3 4} p-mb-type)
-      (throw (ex-info "h264.decode: only P_L0_16x16 (mb_type 0) is supported for P-slice inter macroblocks — P_L0_L0_16x8/P_L0_L0_8x16/P_8x8/P_8x8ref0 (sub-partitioned motion) are out of scope"
+      (= 1 p-mb-type)
+      (decode-inter-16x8-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 2 p-mb-type)
+      (decode-inter-8x16-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 3 p-mb-type)
+      (decode-inter-8x8-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 4 p-mb-type)
+      (throw (ex-info "h264.decode: P_8x8ref0 (mb_type 4) is out of scope — plain P_8x8 (mb_type 3, sub_mb_type P_L0_8x8) is supported"
                        {:p-mb-type p-mb-type}))
 
       :else
@@ -1104,6 +1412,7 @@
      :inter? true
      :skip? false
      :mv mv
+     :mv-field (uniform-mv-field mv)
      :mvd [mvd-x mvd-y]
      :cbp-luma cbp-luma
      :cbp-chroma cbp-chroma
@@ -1297,7 +1606,19 @@
      ;; new as of the P-slice addition; always all-false/all-nil for an
      ;; I-slice picture.
      :mb-inter? (mapv #(boolean (:inter? %)) mb-states)
-     :mb-mvs (mapv :mv mb-states)}))
+     :mb-mvs (mapv :mv mb-states)
+     ;; per-MB per-8x8-quadrant motion field (TL/TR/BL/BR, quadrant idx =
+     ;; qcol + 2*qrow — see `uniform-mv-field`/`mv-field`), nil for intra —
+     ;; new as of the P_16x8/P_8x16/P_8x8 sub-partition addition. For
+     ;; P_L0_16x16/P_Skip all 4 entries are identical (`:mb-mvs` above is
+     ;; enough for those); for P_16x8/P_8x16/P_8x8 this is the ONLY way to
+     ;; observe each partition's own motion vector.
+     :mb-mv-fields (mapv :mv-field mb-states)
+     ;; per-MB inter sub_type — :p-skip/:p-l0-16x16/:p-16x8/:p-8x16/:p-8x8,
+     ;; nil for intra — new as of the P_16x8/P_8x16/P_8x8 sub-partition
+     ;; addition, so tests can assert WHICH inter mb_type/partitioning a
+     ;; (real or hand-authored) bitstream actually used.
+     :mb-sub-types (mapv :sub-type mb-states)}))
 
 (defn decode-idr-frame
   "Decode a single-IDR-I-slice Annex B H.264 elementary stream `annexb-bytes`

@@ -40,13 +40,16 @@ including multi-macroblock/multi-coefficient content — see "Pixel decode:
 CABAC" below for exactly what's validated), and — most recently —
 **CABAC + P-slice/inter prediction** (`P_Skip` + `P_L0_16x16`, the CABAC
 counterpart of the CAVLC-only P-slice increment above — see "Pixel
-decode: CABAC + P-slice (inter)" below). The original framing-only
-boundary still holds for multi-reference/B-slice inter prediction,
-sub-partitioned motion (`P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/
-`P_8x8ref0`, both decode and encode), intra-coded macroblocks within a
-CABAC P-slice (CAVLC P-slices DO decode these, CABAC P-slices don't yet),
-and CABAC encode — those remain out of scope (see below for exactly what
-is/isn't covered).
+decode: CABAC + P-slice (inter)" below), and — most recently — **CAVLC
+P-slice sub-partitioned inter prediction** (`P_L0_L0_16x8`/`P_L0_L0_8x16`/
+`P_8x8` decode — see "Pixel decode: P-slice sub-partitioned inter" below
+for exactly what's covered). The original framing-only boundary still
+holds for multi-reference/B-slice inter prediction, `P_8x8ref0` and
+finer-than-8x8 sub_mb_type splits (`P_L0_8x4`/`P_L0_4x8`/`P_L0_4x4`),
+sub-partitioned motion ENCODE, intra-coded macroblocks within a CABAC
+P-slice (CAVLC P-slices DO decode these, CABAC P-slices don't yet), CABAC
+sub-partitioned inter, and CABAC encode — those remain out of scope (see
+below for exactly what is/isn't covered).
 
 ## Namespaces
 
@@ -64,7 +67,7 @@ is/isn't covered).
 | `h264.encode` | encode-side orchestration: quantization (exact least-squares solve, NOT a memorized MF table, reused unchanged for chroma via QPc) → CAVLC → simplified SAD-based mode decision (luma Intra_16x16 AND chroma Intra_Chroma, jointly for Cb+Cr) → macroblock loop → NAL assembly. LUMA AND CHROMA (Cb/Cr, 4:2:0). See "Pixel encode" below. ALSO: `encode-gop` — P-slice (P_Skip/P_L0_16x16) inter encode: integer-pel full-search + quarter-pel local-refinement motion estimation (`h264.interp`-scored), P_Skip mode decision, full-16-coefficient-regular-block luma residual quantization, chroma residual UNCHANGED from the intra path — see "Pixel encode: P-slice (inter)" below |
 | `h264.intra-pred` | Intra_16x16 luma prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws. Intra_Chroma prediction (§8.3.4, 4:2:0 8x8 blocks, `predict-chroma-8x8`): ALL FOUR modes (DC/Horizontal/Vertical/Plane) on decode — see "Chroma decode" below for why Plane is implemented here but not for luma; encode's mode decision only ever selects DC/Horizontal/Vertical (see "Pixel encode") |
 | `h264.quant` | (also) `chroma-qp`: QPc derivation from QPy + PPS `chroma_qp_index_offset` (§8.5.8 Table 8-15) — reused unchanged by `h264.encode`'s chroma path (intra AND inter) |
-| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. `decode-idr-frame` (single IDR picture, unchanged public API) AND `decode-gop` (a whole IDR+P sequence, new). See "Pixel decode" and "Pixel decode: P-slice (inter)" below for exact scope |
+| `h264.decode` | orchestration: NAL → SPS/PPS/slice header → macroblock loop → (Intra_16x16/Intra_Chroma prediction + CAVLC residual + dequant + inverse transform) → reconstructed luma AND chroma (Cb/Cr) planes. `decode-idr-frame` (single IDR picture, unchanged public API) AND `decode-gop` (a whole IDR+P sequence, new). Also: `P_16x8`/`P_8x16`/`P_8x8` sub-partitioned P-slice inter decode (`mv-predict-partition`/`neighbor-abc`/`mb-quadrant-mv`, a general per-8x8-quadrant §8.4.1.3 motion-vector predictor cross-checked against FFmpeg's `pred_motion`/`pred_16x8_motion`/`pred_8x16_motion`, and `mc-predict-quadrants`, per-quadrant motion compensation). See "Pixel decode", "Pixel decode: P-slice (inter)", and "Pixel decode: P-slice sub-partitioned inter" below for exact scope |
 | `h264.interp` | decode: luma quarter-sample (§8.4.2.2.1, 6-tap FIR + averaging) and chroma eighth-sample (§8.4.2.2.2, bilinear) sub-pel motion-compensated interpolation over a picture-boundary-extended plane. Pure functions, no bitstream dependency. `h264.decode/mc-predict` is the decode-side caller; `h264.encode/mc-predict` (a small deliberate duplication, same convention as that namespace's `neighbor-nc`) calls the SAME `h264.interp` functions on the encode side, both for motion-compensated prediction AND to SCORE candidate motion vectors during motion estimation. See "Sub-pel motion compensation" below |
 | `h264.cabac` | decode: CABAC (Context-Adaptive Binary Arithmetic Coding, §9.3) entropy decode for main/high-profile streams — the literal per-bit arithmetic decoding engine (§9.3.3.2: `decode-decision!`/`decode-bypass!`/`decode-terminate!`, `range-tab-lps`/`trans-idx-lps`/`trans-idx-mps` per Tables 9-44/9-45), context-model initialization from SliceQPY (§9.3.1.1.1, `init-contexts` — I-slice's single `context-init-i` column OR, new, one of 3 `cabac_init_idc`-selected P-slice columns `context-init-p0/p1/p2`, Tables 9-12..9-24 all 4 columns), `mb_type` binarization for BOTH I-slice (`read-mb-type-i!`) AND P-slice (`read-mb-type-p!`, new — a DIFFERENT binarization tree), `mb_skip_flag` (`read-mb-skip-flag!`, new, P-slice only), `mvd_l0` (`read-mvd!`, new, UEG3 binarization), `coded_block_pattern` for INTER macroblocks (`read-coded-block-pattern-inter-cabac!`, new — a COMPLETELY DIFFERENT binarization from CAVLC's me(v) table lookup), `intra_chroma_pred_mode`/`mb_qp_delta` binarization (shared, slice-type-independent), and `residual-block!` (`coded_block_flag`/`significant_coeff_flag`/`last_significant_coeff_flag`/`coeff_abs_level_minus1` combined, now also covering a `:luma-regular` block category — the full 16-coefficient inter residual block — alongside the pre-existing `:luma-dc`/`:luma-ac`/`:chroma-dc`/`:chroma-ac`, returning the SAME scan-order `{:coeffs :total-coeff}` shape `h264.cavlc/residual-block!` does so `h264.decode` shares its dequant/transform pipeline unchanged regardless of entropy method). **I-slice/Intra_16x16 AND P-slice `P_Skip`/`P_L0_16x16`** — see "Pixel decode: CABAC" and "Pixel decode: CABAC + P-slice (inter)" below for exact scope (sub-partitioned inter, intra-in-P-slice, and B-slices remain out of scope) |
 
@@ -599,14 +602,16 @@ IDR picture) is UNCHANGED — it still only ever looks at the first IDR
 slice NAL and ignores anything else, so existing callers are unaffected.
 
 **What's implemented:**
-- **Two mb_types**: `P_Skip` (§7.3.5, the whole-picture-covering
+- **Five mb_types**: `P_Skip` (§7.3.5, the whole-picture-covering
   `mb_skip_run` bookkeeping in `slice_data()` — no `mb_type`/residual bits
-  at all for a skipped macroblock) and `P_L0_16x16` (`mb_type` 0 in a
+  at all for a skipped macroblock), `P_L0_16x16` (`mb_type` 0 in a
   P-slice: one 16x16 partition, one motion vector, `ref_idx_l0` implicit 0
-  since this repo requires `num_ref_idx_l0_active == 1`). `P_L0_L0_16x8`/
-  `P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0` (`mb_type` 1..4, sub-partitioned
-  motion) throw explicitly, matching this repo's existing
-  throw-on-unsupported-mb_type discipline for `I_NxN`/`I_PCM`. Intra
+  since this repo requires `num_ref_idx_l0_active == 1`), and — as of the
+  sub-partition increment, see "Pixel decode: P-slice sub-partitioned
+  inter" below — `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8` (`mb_type` 1..3;
+  `P_8x8ref0`, `mb_type` 4, and any `P_8x8` `sub_mb_type` other than
+  `P_L0_8x8` still throw explicitly, matching this repo's existing
+  throw-on-unsupported-mb_type discipline for `I_NxN`/`I_PCM`). Intra
   macroblocks WITHIN a P-slice (`mb_type` >= 5, `intra_mb_type = mb_type -
   5` per Table 7-13) are also decoded — real encoders do choose intra
   macroblocks inside P-slices, and this repo's existing Intra_16x16 decode
@@ -619,12 +624,25 @@ slice NAL and ignores anything else, so existing callers are unaffected.
   `ref_pic_list_modification_flag_l0` is 0, and unless PPS
   `weighted_pred?` is false — reference reordering and weighted prediction
   are out of scope.
-- **Real median motion-vector prediction** (§8.4.1.3, `mv-predict-16x16`)
-  and the P_Skip-specific predictor special case (§8.4.1.1, `p-skip-mv`) —
-  implemented per spec (median of left/top/top-right-or-top-left
-  neighbors, with the correct "only one ref-idx matches" and "B/C both
-  unavailable → copy A" special cases), NOT hardcoded to always return
-  `[0 0]` — see `h264.decode/mv-predict-16x16`'s docstring.
+- **Real median motion-vector prediction** (§8.4.1.3, `mv-predict-16x16`,
+  now a thin wrapper over the general `mv-predict-partition` the
+  sub-partition increment below introduces) and the P_Skip-specific
+  predictor special case (§8.4.1.1, `p-skip-mv`) — implemented per spec
+  (median of left/top/top-right-or-top-left neighbors, with the correct
+  "only one ref-idx matches" special case), NOT hardcoded to always return
+  `[0 0]` — see `h264.decode/mv-predict-16x16`'s docstring. Both now derive
+  their A/B/C(/D) neighbors at 8x8-QUADRANT granularity
+  (`mb-quadrant-mv`/`neighbor-abc`) rather than reading a neighbor's whole-
+  macroblock `:mv` in one shot — this is REQUIRED (not just a refactor) once
+  a neighbor macroblock can itself be sub-partitioned (`P_16x8`/`P_8x16`/
+  `P_8x8`, see below) and carry DIFFERENT motion vectors in different
+  quadrants; every mb_type this repo supported BEFORE the sub-partition
+  increment happens to have a UNIFORM per-quadrant motion field, so this
+  generalization is proven bit-exact-unchanged for every pre-existing
+  golden vector (see `test/h264/decode_p_slice_test.clj`/
+  `decode_p_subpel_test.clj`, all still passing unchanged) while being
+  necessary for correctness once a sub-partitioned neighbor is possible
+  (see "Pixel decode: P-slice sub-partitioned inter" below).
 - **Real sub-pel motion compensation** (`mc-predict`, delegating to the new
   `h264.interp` namespace — see "Sub-pel motion compensation" below):
   luma quarter-sample interpolation (§8.4.2.2.1, 6-tap FIR
@@ -661,13 +679,13 @@ slice NAL and ignores anything else, so existing callers are unaffected.
 **What's explicitly NOT implemented** (out of scope, not silently wrong):
 CABAC + `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/`P_8x8ref0`/intra-in-P (CABAC
 `P_Skip`/`P_L0_16x16` ARE now implemented, see "Pixel decode: CABAC +
-P-slice (inter)" above), B-slices, multiple reference frames / a real DPB,
-reference-list reordering, weighted prediction, adaptive (MMCO)
-reference-picture marking, and `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8`/
-`P_8x8ref0` (sub-partitioned motion — still limited to ONE 16x16
-partition/one motion vector per macroblock, per the calling task's own
-scope decision; sub-pel/non-zero motion compensation IS now implemented
-for that one partition, see below).
+P-slice (inter)" above; CAVLC `P_L0_L0_16x8`/`P_L0_L0_8x16`/`P_8x8` ARE now
+implemented too, see "Pixel decode: P-slice sub-partitioned inter" below),
+B-slices, multiple reference frames / a real DPB, reference-list
+reordering, weighted prediction, adaptive (MMCO) reference-picture
+marking, `P_8x8ref0` (`mb_type` 4), and any `P_8x8` `sub_mb_type` finer
+than `P_L0_8x8` (`P_L0_8x4`/`P_L0_4x8`/`P_L0_4x4` — see "Pixel decode:
+P-slice sub-partitioned inter" below for the full scope/rationale).
 The encode side has NOT been extended for P-slices at all — `h264.encode`
 remains IDR-only.
 
@@ -690,6 +708,154 @@ tautology: real ffmpeg decodes these exact hand-authored bytes without
 having seen or trusted anything about how they were constructed). See
 "Sub-pel motion compensation" below for the (real + hand-authored)
 non-zero/sub-pel golden vectors.
+
+## Pixel decode: P-slice sub-partitioned inter (Migration step 7's sub-partition increment)
+
+`h264.decode` extends the CAVLC P-slice inter path above from whole-16x16-
+partition-only (`P_Skip`/`P_L0_16x16`) to the smaller inter sub-partition
+`mb_type`s — `P_L0_L0_16x8`, `P_L0_L0_8x16`, and `P_8x8` — each macroblock
+now possibly carrying 2 or 4 independent motion vectors instead of one.
+Same non-realtime, correctness-first reference tier as every other
+decode path here.
+
+**What's implemented:**
+- **`P_L0_L0_16x8`** (`mb_type` 1) and **`P_L0_L0_8x16`** (`mb_type` 2)
+  (`decode-inter-16x8-macroblock!`/`decode-inter-8x16-macroblock!`): 2
+  partitions each (top/bottom 16x8, or left/right 8x16), each with its own
+  `mvd_l0` (read in `mb_pred`'s own mbPartIdx order — §7.3.5.1) — no
+  `ref_idx_l0` either (same `num_ref_idx_l0_active == 1` simplification
+  `P_L0_16x16` already relies on).
+- **`P_8x8`** (`mb_type` 3, `decode-inter-8x8-macroblock!`): §7.3.5.2
+  `sub_mb_pred` reads all 4 `sub_mb_type` values (one per 8x8 quadrant,
+  TL/TR/BL/BR raster order) FIRST, per spec's own bitstream order — but
+  ONLY `sub_mb_type` `P_L0_8x8` (value 0 — one 8x8 partition per quadrant,
+  no further split) is supported; `P_L0_8x4`/`P_L0_4x8`/`P_L0_4x4` (1/2/3 —
+  splitting an 8x8 partition further into 8x4/4x8/4x4 pieces) throw
+  explicitly, matching this repo's existing throw-on-unsupported
+  discipline. Given that constraint, `P_8x8` always has exactly 4
+  sub-partitions, one per quadrant, each with its own `mvd_l0`.
+- **`P_8x8ref0`** (`mb_type` 4) throws explicitly and is OUT OF SCOPE for
+  this increment — even though this repo's `num_ref_idx_l0_active == 1`
+  requirement happens to make its bitstream syntax IDENTICAL to plain
+  `P_8x8`'s (`ref_idx_l0` is never present in the bitstream either way,
+  since it's only signaled when `num_ref_idx_l0_active_minus1 > 0`), it's
+  excluded regardless, per this increment's own scope decision.
+- **A general, spec-faithful §8.4.1.3 motion-vector predictor**
+  (`mv-predict-partition`/`neighbor-abc`/`classify-4x4`/`mb-quadrant-mv`),
+  operating at 8x8-QUADRANT granularity (this repo's finest supported
+  partition size) rather than being special-cased per mb_type:
+  - `classify-4x4` maps a partition's A/B/(C-or-D) neighbor position
+    (4x4-luma-block-unit offsets relative to the current macroblock) to
+    one of `:self` (an earlier-decided quadrant of the SAME macroblock —
+    always resolvable given this repo's fixed TL/TR/BL/BR decode order),
+    `:left`/`:top`/`:topleft`/`:topright` (a specific quadrant of a
+    neighbor macroblock), or `:none` (the target macroblock address does
+    NOT exist yet in raster-scan order — the only case reachable here is
+    one column past the CURRENT macroblock's own right edge at a row
+    that's still within the current macroblock, e.g. `P_8x8`'s
+    bottom-right quadrant's own "C" neighbor).
+  - `neighbor-abc` derives A/B/C for ANY of the 4 supported partition
+    shapes (16x16/16x8/8x16/8x8) uniformly, including the §8.4.1.3.1
+    mbAddrC→mbAddrD substitution — critically, this substitution is keyed
+    on macroblock-ADDRESS availability (`:none`, from `classify-4x4`), NOT
+    on whether an EXISTING neighbor happens to be intra-coded (an intra
+    neighbor contributes ref-idx -1 directly via `mb-quadrant-mv`, with NO
+    D-substitution) — cross-checked against this exact distinction in
+    FFmpeg's `fetch_diagonal_mv` (`libavcodec/h264_mvpred.h`).
+  - `mv-predict-partition` then dispatches to the `P_16x8`/`P_8x16`
+    directional special cases (§8.4.1.3's own bullet list: use ONE named
+    neighbor directly when its ref-idx matches, else fall through) before
+    falling back to the general median process (§8.4.1.3.1) shared by
+    16x16 whole-macroblock partitions AND every 8x8 sub-partition alike —
+    all cross-checked against FFmpeg's `pred_motion`/`pred_16x8_motion`/
+    `pred_8x16_motion` (`libavcodec/h264_mvpred.h`), not re-derived from
+    spec prose alone.
+  - Deliberately OMITS the spec's additional "B and C both
+    address-unavailable, A available → B=C=A" substitution — in this
+    repo's single-reference-frame scope (every real inter neighbor's
+    ref-idx is ALWAYS 0) this is PROVABLY REDUNDANT with the "exactly one
+    neighbor's ref-idx matches → use it directly" rule already in place
+    (verified: without the substitution, an available-but-unmatched-
+    neighbor-starved A still ends up the SOLE exact-match, producing the
+    IDENTICAL result the substitution would have forced via
+    median(A,A,A)=A) — see `h264.decode/median-mv-predict`'s docstring.
+  - **This ALSO required generalizing `mv-predict-16x16`/`p-skip-mv`
+    themselves** (used by `P_L0_16x16`/`P_Skip`, i.e. every mb_type this
+    repo supported BEFORE this increment) to read a neighbor's motion
+    vector at the SPECIFIC quadrant §8.4.1.3 requires (`mb-quadrant-mv`)
+    rather than a neighbor's flat whole-macroblock `:mv` — a latent
+    correctness gap that was harmless before this increment (every
+    pre-existing mb_type has a UNIFORM per-quadrant motion field, so a
+    flat read was indistinguishable from a quadrant-specific one) but
+    would have silently mispredicted whenever `P_L0_16x16`/`P_Skip` is
+    adjacent to a NEWLY-sub-partitioned neighbor. Proven a pure
+    generalization (not a behavior change) for every pre-existing
+    fixture: all of `test/h264/decode_p_slice_test.clj`/
+    `decode_p_subpel_test.clj`/`decode_p_slice_cabac_test.clj` pass
+    bit-exact-unchanged.
+- **Per-quadrant motion compensation** (`mc-predict-quadrants`): decomposes
+  ANY of the 4 supported partition shapes into 4 independent 8x8-luma/
+  4x4-chroma `h264.interp` calls (one per quadrant, each with that
+  quadrant's OWN motion vector) and assembles the results — reusing
+  `h264.interp` COMPLETELY UNCHANGED (motion compensation is a pure
+  per-pixel function of position + that pixel's own partition's mv, so
+  decomposing into uniform 8x8 quadrants is pixel-identical to a single
+  larger-block call even when 2 or 4 quadrants happen to share the SAME
+  mv, as for `P_16x8`/`P_8x16`/`P_L0_16x16`). `mc-predict` (the
+  `P_L0_16x16`/`P_Skip` path) is now itself implemented as the single-mv
+  degenerate case of `mc-predict-quadrants`, for the same reason.
+- **`coded_block_pattern`/`mb_qp_delta`/residual/chroma are UNCHANGED** —
+  factored into a shared `decode-inter-residual-and-reconstruct!` tail
+  used by EVERY inter mb_type (whole-16x16 or sub-partitioned alike),
+  since none of that syntax depends on the partition structure above it,
+  only on the already-fully-derived per-8x8-quadrant motion-compensated
+  prediction.
+
+**What's explicitly NOT implemented** (out of scope, not silently wrong):
+`P_8x8ref0` (`mb_type` 4); `P_8x8` `sub_mb_type` `P_L0_8x4`/`P_L0_4x8`/
+`P_L0_4x4` (finer-than-8x8 splits within an 8x8 partition); CABAC +
+sub-partitioned inter (CABAC P-slice decode remains `P_Skip`/`P_L0_16x16`
+only, see "Pixel decode: CABAC + P-slice (inter)" above); B-slices;
+sub-partitioned inter ENCODE (`h264.encode` remains `P_Skip`/`P_L0_16x16`-
+only on the encode side); and everything else every other P-slice scope
+note in this README already excludes (multiple reference frames, weighted
+prediction, reference-list reordering, adaptive/MMCO reference marking).
+
+**Validated bit-exact (no tolerance) — all 3 fixtures HAND-AUTHORED**
+(real encoders were not found to reliably emit these specific mb_types/
+sub_mb_type combinations on demand, and even when they do there is no way
+to CONTROL which one comes out for a targeted regression test — same
+methodology as `p-16x16-mb0-realac.h264` above, see
+`test/h264/decode_p_slice_subpartition_test.clj`'s own docstring for the
+full rationale and why this remains a genuine independent-decoder
+cross-check rather than a self-consistency tautology):
+- **`p-16x8-mb0.h264`** — single 16x16 macroblock, `P_L0_L0_16x8`, zero
+  residual, DIFFERENT top/bottom partition motion vectors — the bottom
+  partition's own predictor is derived entirely from the top partition's
+  OWN already-decided motion vector (no other neighbor exists), the most
+  basic exercise of the new same-macroblock quadrant-lookup machinery.
+- **`p-8x16-mb0-realac.h264`** — single 16x16 macroblock, `P_L0_L0_8x16`,
+  REAL nonzero luma AC residual in one 8x8 quadrant (mirrors
+  `p-16x16-mb0-realac.h264`'s own single-nonzero-block recipe), DIFFERENT
+  left/right partition motion vectors — exercises the 8x16-specific
+  "use C directly" special case's FALLBACK-to-median path (no topright
+  macroblock exists here).
+- **`p-8x8-cross-mb-multimb.h264`** — 32x16 (2 macroblocks): MB0 = `P_8x8`
+  (`sub_mb_type` `P_L0_8x8` x4) with 4 DIFFERENT per-quadrant motion
+  vectors plus real residual; MB1 = plain `P_L0_16x16`. THE direct
+  regression test for the neighbor-derivation generalization above: MB1's
+  own predictor must read MB0's TR quadrant SPECIFICALLY — a wrong
+  quadrant read (e.g. the OLD flat-per-MB read, or any other quadrant)
+  would produce a visibly different, ffmpeg-mismatching final motion
+  vector, so the bit-exact match is a genuine discriminating proof, not
+  an incidental pass. Real 2-D Cb/Cr gradient IDR reference (not flat)
+  exercises per-quadrant CHROMA motion-compensated placement too.
+
+Additionally, `test/h264/decode_p_slice_subpartition_test.clj` covers 2
+explicit throw tests (`mb_type` 4/`P_8x8ref0`, and `P_8x8` with an
+unsupported `sub_mb_type`), matching this repo's existing
+throw-on-unsupported-syntax discipline (see `h264.decode-test`'s
+`i16x16-mb-info` throw tests for the established convention).
 
 ## Sub-pel motion compensation (`h264.interp`, Migration step 7's sub-pel increment)
 
