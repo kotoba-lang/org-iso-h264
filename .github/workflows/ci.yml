@@ -9,6 +9,40 @@ permissions:
   contents: read
 
 jobs:
+  kotoba-conformance:
+    name: .kotoba Web/Wasm conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Clojure CLI
+        uses: DeLaGuardo/setup-clojure@13.1
+        with:
+          cli: latest
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compile closed Kotoba graphs
+        run: |
+          mkdir -p target/kotoba
+          for root in expgolomb sps; do
+            clojure -M:kotoba compile "test/h264/${root}_conformance.kotoba" \
+              --source-path src --target js-browser --output "target/kotoba/${root}.mjs"
+            clojure -M:kotoba compile "test/h264/${root}_conformance.kotoba" \
+              --source-path src --target wasm32-browser --output "target/kotoba/${root}.wasm"
+          done
+
+      - name: Execute Web and typed Wasm artifacts
+        run: |
+          compiler_src="$(clojure -Spath -M:kotoba | tr ':' '\n' | grep '/compiler/' | head -1)"
+          test -n "$compiler_src"
+          node scripts/verify-kotoba.mjs target/kotoba "$(dirname "$compiler_src")/runtime/browser-host.mjs"
+
   test:
     name: clojure -M:test (JDK ${{ matrix.java }})
     runs-on: ubuntu-latest

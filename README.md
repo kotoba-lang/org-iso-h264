@@ -83,6 +83,28 @@ CABAC by spec, so a wrong PPS parse would very likely produce `:cabac`
 instead (an independent correctness signal beyond "the parser didn't
 throw").
 
+### Kotoba safety profile
+
+`src/h264/expgolomb.kotoba` is the canonical bounded, immutable bit-reader
+profile for new Kotoba consumers. It accepts at most 128 signed-i64 byte
+values, validates bytes at the SPS boundary, carries the bit index explicitly,
+and returns typed `:result` errors for EOF, invalid widths, and oversized
+codes. It uses no ambient capability or mutable host state.
+
+`src/h264/sps.kotoba` is the first real consumer. Its admitted profile is an
+unescaped SPS RBSP with the NAL header included, Baseline profile 66, picture
+order count type 0 or 2, progressive or interlaced dimensions, and optional
+4:2:0 cropping. Invalid headers, reserved bits, malformed dimensions, EOF,
+POC type 1, and non-Baseline profiles fail closed. The existing `.cljc`
+implementation remains the wider semantic oracle; unsupported high-profile
+and scaling-list syntax has not been silently claimed by the Kotoba profile.
+
+The conformance roots are `test/h264/expgolomb_conformance.kotoba` and
+`test/h264/sps_conformance.kotoba`. Both must return `42` on the restricted Web
+backend and the typed Wasm browser host with an empty capability set. The SPS
+vector is the repository's real libx264 64×48 fixture after Annex B extraction
+and emulation-prevention removal.
+
 ## Usage
 
 ```clojure
