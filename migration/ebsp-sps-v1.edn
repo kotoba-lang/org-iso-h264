@@ -22,5 +22,5 @@
         :artifact-sha256 "038b55096fff0ee5ddb6ca79d8076169aa61112294fa033faf49991157c3ec3e"}
   :wasm {:main 42 :oversize-check 42
          :artifact-sha256 "f978aec1bc1286958433c0aa26a7b48e3ba77e73d712778841fcf0c5c22cfdf6"}
-  :required-capabilities []}
- :cutover {:bounded-profile-authorized false :generic-cljc-retained true}}
+  :required-capabilities [] :hosted-ci :passed}
+ :cutover {:bounded-profile-authorized true :generic-cljc-retained true}}
