@@ -8,7 +8,7 @@
                   :main-opts ["-m" "cognitect.test-runner"]}
   :kotoba {:extra-deps {io.github.kotoba-lang/compiler
                         {:git/url "https://github.com/kotoba-lang/compiler.git"
-                         :git/sha "bef32b78852212bc096849d1ff9779c8afae4796"}}
+                         :git/sha "3579cfdb4975458eb0f434052564cd523d8a03da"}}
            :main-opts ["-m" "kotoba.compiler.cli"]}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}

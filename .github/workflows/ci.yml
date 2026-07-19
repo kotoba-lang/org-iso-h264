@@ -30,7 +30,7 @@ jobs:
       - name: Compile closed Kotoba graphs
         run: |
           mkdir -p target/kotoba
-          for root in expgolomb sps; do
+          for root in expgolomb sps ebsp; do
             clojure -M:kotoba compile "test/h264/${root}_conformance.kotoba" \
               --source-path src --target js-browser --output "target/kotoba/${root}.mjs"
             clojure -M:kotoba compile "test/h264/${root}_conformance.kotoba" \

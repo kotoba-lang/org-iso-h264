@@ -1,6 +1,7 @@
 (ns h264.sps
-  (:require [h264.expgolomb :as eg])
-  (:export [parse-baseline]))
+  (:require [h264.expgolomb :as eg]
+            [h264.rbsp :as rbsp])
+  (:export [parse-baseline parse-ebsp-baseline]))
 
 (def sps-type
   [:record :h264/sps
@@ -13,6 +14,7 @@
     [:pic-order-cnt-type :i64]]])
 
 (def sps-result-type [:result [:alias sps-type] :keyword])
+(def unescape-result-type [:result :vector-i64 :keyword])
 (def read-pair-type [:vector [:i64 :i64]])
 (def read-result-type [:result [:alias read-pair-type] :keyword])
 (def context-type [:vector [:i64 :i64 :i64 :i64 :i64]])
@@ -193,3 +195,10 @@
             (fail :unsupported-profile))
           (fail :invalid-nal-header)))
       (fail :invalid-rbsp))))
+
+(defn parse-ebsp-baseline
+  "Validate and unescape a bounded canonical EBSP NAL before SPS parsing."
+  [data :vector-i64] [:alias sps-result-type]
+  (match-result (rbsp/unescape data) unescape-result-type
+    (ok unescaped (parse-baseline unescaped))
+    (err reason (fail reason))))

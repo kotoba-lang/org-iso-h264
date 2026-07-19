@@ -1,5 +1,12 @@
 # kotoba-lang/org-iso-h264
 
+The bounded Kotoba SPS path now accepts canonical H.264 EBSP NAL units as
+well as already-unescaped RBSP. `src/h264/rbsp.kotoba` validates every byte,
+limits a NAL to 128 bytes, removes only valid `00 00 03 {00..03}` emulation
+prevention sequences, and rejects trailing, unnecessary, or missing
+prevention bytes. `parse-ebsp-baseline` then delegates to the existing nominal
+Baseline SPS parser without weakening its profile/POC/dimension checks.
+
 Zero-dep portable `.cljc` H.264 (ITU-T H.264 / ISO/IEC 14496-10 AVC)
 bitstream **framing** — Annex B NAL unit splitting/writing, NAL header
 parsing, and SPS/PPS (Sequence/Picture Parameter Set) decode **and
