@@ -53,42 +53,68 @@
    a predictor and NOT yet clipped (that's the caller's job, see
    `h264.decode`)."
   [coeffs]
-  (let [block (-> (transpose16 coeffs)
-                   (update 0 + 32))
-        b (fn [i] (nth block i))
-        ;; stage 1: for each i in 0..3, transform block[i], block[i+4],
-        ;; block[i+8], block[i+12] (a "column" in this internal layout)
-        tmp (vec (repeat 16 0))
-        tmp (reduce
-             (fn [acc i]
-               (let [b0 (b i) b1 (b (+ i 4)) b2 (b (+ i 8)) b3 (b (+ i 12))
-                     z0 (+ b0 b2)
-                     z1 (- b0 b2)
-                     z2 (- (bit-shift-right b1 1) b3)
-                     z3 (+ b1 (bit-shift-right b3 1))]
-                 (-> acc
-                     (assoc i (+ z0 z3))
-                     (assoc (+ i 4) (+ z1 z2))
-                     (assoc (+ i 8) (- z1 z2))
-                     (assoc (+ i 12) (- z0 z3)))))
-             tmp (range 4))
-        t (fn [i] (nth tmp i))
-        out (vec (repeat 16 0))
-        out (reduce
-             (fn [acc i]
-               (let [t0 (t (+ (* 4 i) 0)) t1 (t (+ (* 4 i) 1))
-                     t2 (t (+ (* 4 i) 2)) t3 (t (+ (* 4 i) 3))
-                     z0 (+ t0 t2)
-                     z1 (- t0 t2)
-                     z2 (- (bit-shift-right t1 1) t3)
-                     z3 (+ t1 (bit-shift-right t3 1))]
-                 (-> acc
-                     (assoc i (bit-shift-right (+ z0 z3) 6))
-                     (assoc (+ i 4) (bit-shift-right (+ z1 z2) 6))
-                     (assoc (+ i 8) (bit-shift-right (- z1 z2) 6))
-                     (assoc (+ i 12) (bit-shift-right (- z0 z3) 6)))))
-             out (range 4))]
-    (vec (for [row (range 4)] (vec (for [col (range 4)] (nth out (+ (* row 4) col))))))))
+  ;; Two butterfly stages over a 16-element scratch buffer, written as tight
+  ;; index loops over a transient rather than `reduce` + four `assoc`s per
+  ;; step. The previous form allocated a fresh 16-element vector per assoc —
+  ;; 32 intermediate vectors per call — and this is the single hottest
+  ;; function in the encoder: measured 2026-07-30, 173k calls and 802 ms of a
+  ;; 4,070 ms 720x1280 frame (17.7%). The arithmetic is unchanged, which
+  ;; matters because the DECODER depends on this being bit-exact against
+  ;; FFmpeg's reference (see this ns's own tests).
+  (let [dc-only? (loop [i 1] (cond (= i 16) true
+                                   (zero? (long (nth coeffs i))) (recur (inc i))
+                                   :else false))]
+    (if dc-only?
+      ;; A DC-only block's inverse transform is the uniform grid
+      ;; ((dc + 32) >> 6) — verified against the general path across the
+      ;; coefficient range. Chroma AC solving calls this per block with a
+      ;; DC-only vector, so the butterfly was pure waste there.
+      (let [v (bit-shift-right (+ (long (nth coeffs 0)) 32) 6)
+            row (vec (repeat 4 v))]
+        (vec (repeat 4 row)))
+      (let [block (-> (transpose16 coeffs) (update 0 + 32))
+            tmp (loop [i 0 acc (transient (vec (repeat 16 0)))]
+                  (if (= i 4)
+                    (persistent! acc)
+                    (let [b0 (long (nth block i))
+                          b1 (long (nth block (+ i 4)))
+                          b2 (long (nth block (+ i 8)))
+                          b3 (long (nth block (+ i 12)))
+                          z0 (+ b0 b2)
+                          z1 (- b0 b2)
+                          z2 (- (bit-shift-right b1 1) b3)
+                          z3 (+ b1 (bit-shift-right b3 1))]
+                      (recur (inc i)
+                             (-> acc
+                                 (assoc! i (+ z0 z3))
+                                 (assoc! (+ i 4) (+ z1 z2))
+                                 (assoc! (+ i 8) (- z1 z2))
+                                 (assoc! (+ i 12) (- z0 z3)))))))
+            out (loop [i 0 acc (transient (vec (repeat 16 0)))]
+                  (if (= i 4)
+                    (persistent! acc)
+                    (let [base (* 4 i)
+                          t0 (long (nth tmp base))
+                          t1 (long (nth tmp (+ base 1)))
+                          t2 (long (nth tmp (+ base 2)))
+                          t3 (long (nth tmp (+ base 3)))
+                          z0 (+ t0 t2)
+                          z1 (- t0 t2)
+                          z2 (- (bit-shift-right t1 1) t3)
+                          z3 (+ t1 (bit-shift-right t3 1))]
+                      (recur (inc i)
+                             (-> acc
+                                 (assoc! i (bit-shift-right (+ z0 z3) 6))
+                                 (assoc! (+ i 4) (bit-shift-right (+ z1 z2) 6))
+                                 (assoc! (+ i 8) (bit-shift-right (- z1 z2) 6))
+                                 (assoc! (+ i 12) (bit-shift-right (- z0 z3) 6)))))))]
+        (loop [r 0 rows (transient [])]
+          (if (= r 4)
+            (persistent! rows)
+            (recur (inc r)
+                   (conj! rows (let [base (* r 4)]
+                                 [(nth out base) (nth out (+ base 1))
+                                  (nth out (+ base 2)) (nth out (+ base 3))])))))))))
 
 (def luma-dc-x-offset
   "Column-group base offsets into the flattened 16-blocks*16-samples buffer

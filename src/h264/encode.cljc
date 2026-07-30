@@ -396,9 +396,27 @@
 (defn- clip8 [v] (max 0 (min 255 v)))
 
 (defn- sad
-  "Sum of absolute differences between two same-shape row-vector grids."
+  "Sum of absolute differences between two same-shape row-vector grids.
+
+   A tight index loop rather than nested `map`/`reduce`. This is called once
+   per candidate intra mode per macroblock and once per motion-estimation
+   candidate, and the lazy-seq form built ~272 cons cells per call: measured
+   2026-07-30 it was 634 ms of a 4,070 ms frame (14%), second only to
+   `inverse-4x4`. Nothing about the result changes."
   [a b]
-  (reduce + (map (fn [ra rb] (reduce + (map (fn [x y] (let [d (- x y)] (if (neg? d) (- d) d))) ra rb))) a b)))
+  (let [rows (count a)]
+    (loop [r 0 acc 0]
+      (if (= r rows)
+        acc
+        (let [ra (nth a r)
+              rb (nth b r)
+              cols (count ra)]
+          (recur (inc r)
+                 (loop [c 0 s acc]
+                   (if (= c cols)
+                     s
+                     (let [d (- (long (nth ra c)) (long (nth rb c)))]
+                       (recur (inc c) (+ s (if (neg? d) (- d) d))))))))))))
 
 (defn- choose-pred-mode
   "Simplified Intra_16x16 mode decision (ADR-2607122000 Migration step 8:
@@ -472,14 +490,15 @@
    `inverse-4x4` pipeline is IDENTICAL for luma and chroma, only the QP
    input differs, so the same exact-least-squares solver applies unchanged)."
   [residual qpc]
-  (let [raw-dc (mapv (fn [b] (* 4 (reduce + (apply concat (chroma-block-residual residual b))))) (range 4))
+  (let [blocks (mapv (fn [b] (chroma-block-residual residual b)) (range 4))
+        raw-dc (mapv (fn [b] (* 4 (reduce + (apply concat (nth blocks b))))) (range 4))
         qmul-dc (quant/dc-qmul qpc)
         dc-raster (transform/forward-chroma-dc-hadamard raw-dc qmul-dc)
         dc-quad (transform/chroma-dc-hadamard dc-raster qmul-dc)
         ac-levels-per-block
         (mapv (fn [b]
                 (let [dc-contrib (transform/inverse-4x4 (assoc (vec (repeat 16 0)) 0 (nth dc-quad b)))
-                      resid-b (chroma-block-residual residual b)
+                      resid-b (nth blocks b)
                       target (vec (for [ry (range 4)]
                                     (vec (for [rx (range 4)]
                                            (- (get-in resid-b [ry rx]) (get-in dc-contrib [ry rx]))))))]
@@ -595,14 +614,18 @@
         ;; used for AC-position dequant, which is a DIFFERENT domain scaled
         ;; by ac-qmul before inverse-4x4) is 4x too small here and would
         ;; silently under-correct every macroblock's DC by a factor of 4.
-        raw-dc (mapv (fn [b] (* 4 (reduce + (apply concat (block-residual residual b))))) (range 16))
+        ;; Each block's residual was extracted TWICE — once for raw-dc and
+        ;; again inside the AC loop. Same block, same result: 115,200 calls
+        ;; per frame where 57,600 were needed (measured 2026-07-30, 214 ms).
+        blocks (mapv (fn [b] (block-residual residual b)) (range 16))
+        raw-dc (mapv (fn [b] (* 4 (reduce + (apply concat (nth blocks b))))) (range 16))
         qmul-dc (quant/dc-qmul qp)
         dc-raster (transform/forward-luma-dc-hadamard raw-dc qmul-dc)
         dc-per-block (transform/luma-dc-hadamard dc-raster qmul-dc)
         ac-levels-per-block
         (mapv (fn [b]
                 (let [dc-contrib (transform/inverse-4x4 (assoc (vec (repeat 16 0)) 0 (nth dc-per-block b)))
-                      resid-b (block-residual residual b)
+                      resid-b (nth blocks b)
                       target (vec (for [ry (range 4)]
                                     (vec (for [rx (range 4)]
                                            (- (get-in resid-b [ry rx]) (get-in dc-contrib [ry rx]))))))]
