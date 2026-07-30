@@ -205,17 +205,113 @@
         f (- y (mod y 1))]
     #?(:clj (long f) :cljs f)))
 
+(def ^:private ac-solver-int-cache (atom {}))
+
+(defn- gcd* [a b]
+  (loop [x (abs (long a)) y (abs (long b))] (if (zero? y) x (recur y (mod x y)))))
+
+(defn- lcm*
+  "lcm of two positive integers, dividing BEFORE multiplying — `(a*b)/g`
+   overflows a long for denominators this code legitimately sees (the
+   matrix-wide LCM reaches 49 bits at qp 5)."
+  [a b]
+  (let [a (abs (long a)) b (abs (long b)) g (gcd* a b)]
+    (if (zero? g) (max a b) (* (quot a g) b))))
+
+(defn- row->int
+  "One row of the folded rational matrix -> `{:num [16 integers] :den D}`,
+   reduced by the gcd of everything so the magnitudes stay as small as the
+   row allows. PER-ROW rather than matrix-wide on purpose: the solve
+   accumulates one row at a time, and a matrix-wide common denominator pushes
+   the worst-case accumulator to 62 bits where per-row plus gcd reduction
+   keeps it at 54 (measured across qp 0..51 with |target| <= 512: 9 bits of
+   headroom in a long). Note 54 bits is one bit PAST a ClojureScript double's
+   53-bit mantissa — which is fine only because the cljs branch below never
+   produces these magnitudes: it scales doubles by 2^30, giving a ~43-bit
+   accumulator. The exact-ratio numbers are JVM-only by construction."
+  [row]
+  ;; JVM: `mat-inverse` yields exact ratios, so each entry has a real
+  ;; denominator and this representation is lossless.
+  ;; ClojureScript: that same fn "degrades gracefully to double-precision
+  ;; floats" (its own docstring) — there are no ratios to decompose, so scale
+  ;; by a power of two instead. That leaves cljs exactly as approximate as it
+  ;; already was before this change, and no more; `ratio?`/`numerator`/
+  ;; `denominator` are JVM-only and must not appear unguarded in a .cljc file.
+  (let [pairs #?(:clj (mapv (fn [x]
+                              (if (ratio? x)
+                                [(long (numerator x)) (long (denominator x))]
+                                [(long x) 1]))
+                            row)
+                 :cljs (let [scale 1073741824] ; 2^30
+                         (mapv (fn [x] [(js/Math.round (* scale (double x))) scale]) row)))
+        D (long (reduce lcm* 1 (distinct (map second pairs))))
+        nums (mapv (fn [[n d]] (* (long n) (quot D (long d)))) pairs)
+        g (reduce gcd* D nums)
+        g (if (zero? g) 1 g)]
+    {:num (mapv #(quot (long %) g) nums) :den (quot D g)}))
+
+(defn- ac-solver-int
+  "Memoized per-QP EXACT INTEGER form of the AC least-squares solve.
+
+   `ac-solver` returns `[MacT (MacT·Mac)^-1]` and `solve-ac-levels` used to
+   apply them as TWO rational matrix-vector products per 4x4 block. Two
+   things were wrong with that, and only the second is obvious:
+
+   1. The product `(MacT·Mac)^-1 · MacT` does not depend on the block — it is
+      a fixed 15x16 matrix per QP. Applying the factors separately redid that
+      fold once per block instead of once per QP.
+   2. Those products ran in Clojure ratio arithmetic. Every multiply
+      allocated a Ratio and normalised by GCD. Measured 2026-07-30 on a real
+      720x1280 frame: the whole encode cost 11,957 ms, and a synthetic
+      standing in for just these two products cost 13,923 ms — i.e. this was
+      effectively ALL of encode time, at ~242 us per 4x4 block.
+
+   So fold it once per QP and carry each row as exact integers over a common
+   denominator. This is a re-association plus an exact change of
+   representation, NOT an approximation: `solve-ac-levels` stays
+   bit-identical to the rational path (asserted in `encode-test` over every
+   qp 0..51 plus edge vectors). That distinction matters because this repo
+   chose an exact solve over a memorized MF table deliberately — a memorized
+   table measured ~20% cross-coefficient leakage versus this pipeline's ~2%
+   (see the namespace docstring). Speed must not buy back that leakage.
+
+   Returns `[{:num [16] :den D} x15]`, one entry per AC row."
+  [qp]
+  (or (@ac-solver-int-cache qp)
+      (let [[MacT inv] (ac-solver qp)
+            rows (mapv row->int (mat-mul inv MacT))]
+        (swap! ac-solver-int-cache assoc qp rows)
+        rows)))
+
+(defn- round-div
+  "round(p/d) for integer p and positive integer d, ties away from negative
+   infinity — the exact-integer counterpart of `round-nearest`'s
+   `floor(x + 1/2)`, without going through a double."
+  [p d]
+  (let [n (+ (* 2 (long p)) (long d))
+        m (* 2 (long d))
+        q (quot n m)]
+    ;; quot truncates toward zero; floor differs only for negative non-exact
+    (if (and (neg? n) (not (zero? (rem n m)))) (dec q) q)))
+
 (defn- solve-ac-levels
   "Solve the 15 AC (raster positions 1..15) integer CAVLC levels for one
    4x4 block's target pixel-domain residual (`target-flat`, 16 values,
    raster idx=row*4+col), via the exact least-squares inverse
-   (`ac-solver`) of this repo's own tested dequant+inverse-transform
+   (`ac-solver-int`) of this repo's own tested dequant+inverse-transform
    pipeline. Returns a 15-element vector indexed by (raster-position - 1)."
   [qp target-flat]
-  (let [[MacT MacTMac-inv] (ac-solver qp)
-        rhs (mat-vec-mul MacT target-flat)
-        sol (mat-vec-mul MacTMac-inv rhs)]
-    (mapv round-nearest sol)))
+  (let [rows (ac-solver-int qp)
+        t (vec target-flat)]
+    (loop [r 0 acc (transient [])]
+      (if (= r 15)
+        (persistent! acc)
+        (let [{:keys [num den]} (nth rows r)
+              p (loop [c 0 s 0]
+                  (if (= c 16)
+                    s
+                    (recur (inc c) (+ s (* (long (nth num c)) (long (nth t c)))))))]
+          (recur (inc r) (conj! acc (round-div p den))))))))
 
 (defn- ac-dequant-raster
   "Given 15 AC integer levels (indexed by raster-position-1, i.e. position

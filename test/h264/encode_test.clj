@@ -226,3 +226,67 @@
       (is (= cr-ref (:cr result)) "Cr bit-exact vs real ffmpeg's own decode of this exact file")
       (is (= [150] (distinct (:cb result))) "Cb reproduces the exact uniform source value, no chroma AC needed")
       (is (= [180] (distinct (:cr result))) "Cr reproduces the exact uniform source value, no chroma AC needed"))))
+
+(deftest ^:parallel folded-integer-solve-is-bit-identical-to-the-rational-one
+  ;; solve-ac-levels used to apply (MacT·Mac)^-1 and MacT as two SEPARATE
+  ;; rational matrix-vector products per 4x4 block. Measured 2026-07-30, that
+  ;; was effectively all of encode time (~242 us/block; a whole 720x1280 frame
+  ;; cost 11,957 ms). It is now folded once per QP and carried as exact
+  ;; integers over a per-row denominator.
+  ;;
+  ;; This repo chose an exact solve over a memorized MF table deliberately —
+  ;; the table measured ~20% cross-coefficient leakage against this
+  ;; pipeline's ~2%. So the speed-up is only legitimate if the levels are
+  ;; UNCHANGED, not merely close. Assert that directly against the rational
+  ;; path over every QP the spec allows.
+  (let [ac-solver #'h264.encode/ac-solver
+        mat-vec-mul #'h264.encode/mat-vec-mul
+        round-nearest #'h264.encode/round-nearest
+        solve #'h264.encode/solve-ac-levels
+        rational-solve (fn [qp t]
+                         (let [[MacT inv] (@ac-solver qp)]
+                           (mapv @round-nearest
+                                 (@mat-vec-mul inv (@mat-vec-mul MacT t)))))
+        rng (java.util.Random. 20260730)]
+    (doseq [qp (range 0 52)]
+      (testing (str "qp " qp)
+        (doseq [t (concat
+                   ;; random residuals across the plausible range
+                   (repeatedly 20 #(vec (repeatedly 16 (fn [] (- (.nextInt rng 1024) 512)))))
+                   ;; and the degenerate ones that tend to sit on rounding ties
+                   [(vec (repeat 16 0))
+                    (vec (repeat 16 255))
+                    (vec (repeat 16 -255))
+                    (vec (repeat 16 512))
+                    (vec (repeat 16 -512))
+                    (vec (map-indexed (fn [i _] (if (even? i) 512 -512)) (range 16)))
+                    (assoc (vec (repeat 16 0)) 0 511)
+                    (assoc (vec (repeat 16 0)) 15 -511)])]
+          (is (= (rational-solve qp t) (@solve qp t))
+              (str "levels diverged at qp " qp " for " (pr-str t))))))))
+
+(deftest ^:parallel folded-solve-keeps-the-accumulator-inside-a-long
+  ;; The per-row denominator is not an aesthetic choice: a matrix-wide common
+  ;; denominator pushes the worst-case accumulator to 62 bits (qp 5), leaving
+  ;; almost no margin in a long. Per-row plus gcd reduction brings it to 54,
+  ;; i.e. 9 bits of headroom.
+  ;;
+  ;; 54 bits is one bit PAST a ClojureScript double's 53-bit mantissa. That is
+  ;; not a defect here: these exact-ratio magnitudes are JVM-only by
+  ;; construction (mat-inverse yields doubles on cljs, and row->int's cljs
+  ;; branch scales them by 2^30, giving ~43 bits). This test therefore asserts
+  ;; the LONG bound — asserting the cljs bound against JVM-derived numbers is
+  ;; what the first version of it did, and it failed for the wrong reason.
+  (let [ac-solver-int #'h264.encode/ac-solver-int
+        worst (atom 0)]
+    (doseq [qp (range 0 52)
+            {:keys [num den]} (@ac-solver-int qp)]
+      (is (pos? den) (str "denominator must be positive at qp " qp))
+      (is (= 16 (count num)))
+      ;; 16 terms, |target| bounded by 512, doubled by round-div
+      (swap! worst max (* 2 16 512 (apply max (map #(abs (long %)) num)))))
+    (is (< @worst (bit-shift-left 1 62))
+        (str "worst accumulator " @worst " must stay inside a long"))
+    (is (>= @worst (bit-shift-left 1 50))
+        (str "if this drops far below 2^50 the bound above stopped being "
+             "load-bearing and the docstring's 54-bit claim is stale"))))
