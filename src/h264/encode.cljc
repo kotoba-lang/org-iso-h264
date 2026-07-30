@@ -960,6 +960,70 @@
 ;;     existing "try a small candidate set, pick min-SAD" style for intra
 ;;     mode decision. ---
 
+(def ^:private no-sad-cutoff
+  "One more than the largest SAD a 16x16 block of 0..255 samples can produce
+   (256*255) — a cutoff that can never fire, for the first candidate of a
+   search."
+  (inc (* 256 255)))
+
+(defn- sad-mc
+  "SAD between `src` (a `size`x`size` row-vector grid) and the
+   motion-compensated reference block at `mv`, computed WITHOUT materialising
+   the predicted block, and abandoned as soon as the running sum exceeds
+   `cutoff` (the returned value is then > `cutoff` but otherwise meaningless).
+
+   Two savings over `sad` on `interp/mc-luma-block`'s output, both structural
+   rather than arithmetic — the per-sample interpolation is the same call:
+
+   - no `size`x`size` grid is allocated per candidate, and motion estimation
+     throws away every candidate but one
+   - a candidate already worse than the best so far stops early, usually within
+     a row or two
+
+   The cutoff is tested per ROW, not per sample: a hopeless candidate exceeds it
+   in the first row or two either way, and a per-sample test would add a branch
+   to the inner loop to save little.
+
+   `>` rather than `>=` is deliberate. A candidate whose SAD EQUALS the best so
+   far must be allowed to finish, because `apply min-key` — which this replaces
+   in `me-full-search`/`me-subpel-refine` — keeps the LAST minimum on a tie
+   (verified against `min-key` directly, not assumed), so aborting ties would
+   silently change which motion vector the search picks, and with it the encoded
+   bitstream."
+  [src ref-luma w h x0 y0 [mvx mvy] size cutoff]
+  (let [ix (bit-shift-right mvx 2) fx (bit-and mvx 3)
+        iy (bit-shift-right mvy 2) fy (bit-and mvy 3)
+        bx (+ x0 ix) by (+ y0 iy)]
+    (loop [ry 0 acc 0]
+      (if (or (= ry size) (> acc cutoff))
+        acc
+        (let [srow (nth src ry)
+              py (+ by ry)]
+          (recur (inc ry)
+                 (loop [rx 0 s acc]
+                   (if (= rx size)
+                     s
+                     (let [d (- (long (nth srow rx))
+                                (long (interp/quarter-pel-luma ref-luma w h (+ bx rx) py fx fy)))]
+                       (recur (inc rx) (+ s (if (neg? d) (- d) d))))))))))))
+
+(defn- best-mv
+  "Pick the motion vector minimizing `sad-mc`, over `candidates` (each a
+   quarter-sample `[mvx mvy]`), threading the best-so-far in as the cutoff.
+
+   Replaces `apply min-key` and must agree with it exactly: candidates are
+   visited in the given order and the best is replaced on `<=`, so a tie keeps
+   the LAST one, which is what `min-key` does."
+  [src ref-luma w h x0 y0 size candidates]
+  (loop [cs (seq candidates) chosen nil best no-sad-cutoff]
+    (if-not cs
+      chosen
+      (let [mv (first cs)
+            cost (sad-mc src ref-luma w h x0 y0 mv size best)]
+        (if (<= cost best)
+          (recur (next cs) mv cost)
+          (recur (next cs) chosen best))))))
+
 (defn- me-full-search
   "Integer-pel full search: minimize luma SAD between `src` (16x16 grid) and
    `ref-frame`'s luma plane at the macroblock's zero-motion position offset
@@ -970,12 +1034,9 @@
   (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
         x0 (* mb-x 16) y0 (* mb-y 16)
         candidates (for [dy (range (- search-range) (inc search-range))
-                          dx (range (- search-range) (inc search-range))]
-                     [dx dy])
-        [bx by] (apply min-key
-                       (fn [[dx dy]] (sad src (interp/mc-luma-block ref-luma w h x0 y0 [(* dx 4) (* dy 4)] 16)))
-                       candidates)]
-    [(* bx 4) (* by 4)]))
+                         dx (range (- search-range) (inc search-range))]
+                     [(* dx 4) (* dy 4)])]
+    (best-mv src ref-luma w h x0 y0 16 candidates)))
 
 (defn- me-subpel-refine
   "Quarter-pel LOCAL refinement around `best-mv` (already a multiple of 4,
@@ -985,15 +1046,13 @@
    non-multiple-of-4 (half/quarter-pel) motion vectors are a normal outcome
    of this step, motion-compensated via the SAME `h264.interp` sub-pel path
    `h264.decode/mc-predict` uses for decode."
-  [src ref-frame mb-x mb-y best-mv]
+  [src ref-frame mb-x mb-y integer-mv]
   (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
         x0 (* mb-x 16) y0 (* mb-y 16)
-        [base-mvx base-mvy] best-mv
+        [base-mvx base-mvy] integer-mv
         candidates (for [dmy (range -3 4) dmx (range -3 4)]
                      [(+ base-mvx dmx) (+ base-mvy dmy)])]
-    (apply min-key
-           (fn [[mvx mvy]] (sad src (interp/mc-luma-block ref-luma w h x0 y0 [mvx mvy] 16)))
-           candidates)))
+    (best-mv src ref-luma w h x0 y0 16 candidates)))
 
 (def ^:private inter-cbp->golomb
   "Reverse lookup of `h264.decode/golomb-to-inter-cbp` — given an actual

@@ -63,7 +63,44 @@
      the decoded picture are substituted by the nearest picture-boundary
      sample (§8.4.2.2.1's boundary-sample derivation process) — implemented
      by `sample`'s coordinate clamping, needed whenever a motion vector (or
-     the 6-tap filter's own +/-2/+3 reach) points outside the picture."
+     the 6-tap filter's own +/-2/+3 reach) points outside the picture.
+
+   ## `sample` is the hottest function in a P-frame encode, and copying the
+   ## support region into an array does NOT help (measured, 2026-07-30)
+
+   A sampling profile of one P-frame encode attributes **42.5%** of the whole
+   frame to `sample` — more than motion estimation's own arithmetic, residual
+   coding and entropy coding combined (`com-junkawasaki/root` ADR-2800002800).
+   The obvious reading is that the read itself is expensive (a clamp plus a
+   trie walk into a ~900k-element persistent vector) and that hoisting the
+   block's whole support region into a dense array first would fix it.
+
+   **It was implemented and it was 1.3x SLOWER** — measured by interleaving the
+   two versions so both saw the same machine load, byte-identical output in
+   every run, three rounds, no ambiguity. Two reasons, both worth knowing
+   before trying again:
+
+   - It relocates reads instead of removing them. Copying a 21x21 window costs
+     441 plane reads plus 441 array writes, and the interpolators then still
+     perform every one of their original reads, just against the copy.
+   - The read pattern was already cache-friendly. A block's support region
+     spans a few dozen 32-element vector leaves, all resident after the first
+     pass, so the trie walk was predictable rather than miss-bound.
+
+   Sizing the window per fraction (no padding when a fraction is zero) removed
+   part of the loss but not all of it, because motion estimation's integer
+   search — 289 of 338 candidates per macroblock at the default search range —
+   reads each pixel exactly ONCE, so for the common case any copy is pure
+   overhead.
+
+   What the 42.5% actually reflects is the number of CALLS, not their cost:
+   `center-j` evaluates `six-tap-h` at six rows for every output pixel, so one
+   pixel costs 36 reads, and adjacent pixels re-read five of those six rows.
+   Removing that means computing the horizontal pass ONCE into an intermediate
+   buffer and running the vertical pass over it — exactly FFmpeg's two-pass
+   `h264_qpel_hv_lowpass`, which the `center-j` note above describes and this
+   namespace deliberately does not do. That, not a support window, is the
+   change worth measuring next."
   )
 
 (defn- clip8 [v] (max 0 (min 255 v)))
