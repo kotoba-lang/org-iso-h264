@@ -1056,6 +1056,39 @@
                                 (long (interp/quarter-pel-luma ref-luma w h (+ bx rx) py fx fy)))]
                        (recur (inc rx) (+ s (if (neg? d) (- d) d))))))))))))
 
+(defn- sad-mc-planes
+  "`sad-mc` against a prepared `interp/subpel-planes` region instead of the
+   reference plane: same fused accumulation, same per-row cutoff, same `>`
+   rather than `>=` so ties still finish (see `sad-mc`). `(rx,ry)` is the
+   candidate block's top-left in region coordinates.
+
+   The fraction is resolved ONCE via `interp/subpel-selector`, so the inner loop
+   is two array reads and an average rather than a sixteen-way `cond` per
+   pixel — which is what dominated once `subpel-planes` had removed the
+   reference-plane reads."
+  [src planes rx ry fx fy size cutoff]
+  (let [n (long (:n planes))
+        {:keys [a ao b bo]} (interp/subpel-selector planes fx fy)
+        ^ints a a
+        ^ints bb (or b a)
+        two? (some? b)
+        base (+ (* ry n) rx)]
+    (loop [row 0 acc 0]
+      (if (or (= row size) (> acc cutoff))
+        acc
+        (let [srow (nth src row)
+              i0 (+ base (* row n))]
+          (recur (inc row)
+                 (loop [col 0 s acc]
+                   (if (= col size)
+                     s
+                     (let [i (+ i0 col)
+                           p (if two?
+                               (bit-shift-right (+ (aget a (+ i ao)) (aget bb (+ i bo)) 1) 1)
+                               (aget a (+ i ao)))
+                           d (- (long (nth srow col)) (long p))]
+                       (recur (inc col) (+ s (if (neg? d) (- d) d))))))))))))
+
 (defn- best-mv
   "Pick the motion vector minimizing `sad-mc`, over `candidates` (each a
    quarter-sample `[mvx mvy]`), threading the best-so-far in as the cutoff.
@@ -1099,9 +1132,28 @@
   (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
         x0 (* mb-x 16) y0 (* mb-y 16)
         [base-mvx base-mvy] integer-mv
+        bix (bit-shift-right base-mvx 2)
+        biy (bit-shift-right base-mvy 2)
+        ;; All 49 candidates read the same small integer neighbourhood, so the
+        ;; half-sample planes are built ONCE here rather than re-filtered per
+        ;; candidate per pixel — 529 reference-plane reads for the whole search
+        ;; instead of ~231,000. See `interp/subpel-planes`.
+        planes (interp/subpel-planes ref-luma w h (+ x0 bix) (+ y0 biy) 16)
         candidates (for [dmy (range -3 4) dmx (range -3 4)]
                      [(+ base-mvx dmx) (+ base-mvy dmy)])]
-    (best-mv src ref-luma w h x0 y0 16 candidates)))
+    (loop [cs (seq candidates) chosen nil best no-sad-cutoff]
+      (if-not cs
+        chosen
+        (let [[mvx mvy :as mv] (first cs)
+              ;; region-relative top-left of this candidate's block: the region
+              ;; starts one integer sample before the base position, and a
+              ;; candidate's integer part is either the base's or one less.
+              rx (- (bit-shift-right mvx 2) bix -1)
+              ry (- (bit-shift-right mvy 2) biy -1)
+              cost (sad-mc-planes src planes rx ry (bit-and mvx 3) (bit-and mvy 3) 16 best)]
+          (if (<= cost best)
+            (recur (next cs) mv cost)
+            (recur (next cs) chosen best)))))))
 
 (def ^:private inter-cbp->golomb
   "Reverse lookup of `h264.decode/golomb-to-inter-cbp` — given an actual

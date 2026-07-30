@@ -114,6 +114,14 @@
         cy (max 0 (min (dec h) y))]
     (nth plane (+ (* cy w) cx))))
 
+(defn- new-window
+  "Dense integer array of `n` entries, for the precomputed planes below.
+   `aget`/`aset` on it MUST be reached through an `^ints`-hinted local or
+   parameter: unhinted, they compile to reflective array access, and measured
+   that turned a one-second frame encode into minutes."
+  [n]
+  #?(:clj (int-array n) :cljs (make-array n)))
+
 (defn- six-tap-h
   "Unrounded, unclipped horizontal 6-tap FIR sum (§8.4.2.2.1) centered
    between (x,y) and (x+1,y): (G+H)*20 - (F+I)*5 + (E+J)."
@@ -206,6 +214,152 @@
         p10 (sample plane w h x (inc y))
         p11 (sample plane w h (inc x) (inc y))]
     (clip8 (bit-shift-right (+ (* a p00) (* b p01) (* c p10) (* d p11) 32) 6))))
+
+;; --- shared half-sample planes for a sub-pel search ---------------------
+;;
+;; `h264.encode/me-subpel-refine` evaluates 49 candidate vectors (+/-3 quarter
+;; samples in each direction) around one integer vector, and measured by
+;; caller attribution it was **~61% of a whole P-frame encode** — more than
+;; the integer search, the residual coding and the final reconstruction put
+;; together (`com-junkawasaki/root` ADR-2800002800).
+;;
+;; All 49 candidates read the SAME small integer neighbourhood: a quarter
+;; offset of -3..+3 around a multiple of 4 lands on integer position `ix-1` or
+;; `ix`, so the candidates' blocks span `size+1` integer positions, `size+2`
+;; once the tables' own +1 reach is included. Every one of the 16 quarter-sample
+;; positions is then either an integer sample or a rounded average of two of
+;; three half-sample values at that neighbourhood (§8.4.2.2.1 Figure 8-4, which
+;; is what `luma-at`'s table below says).
+;;
+;; So the three half-sample planes are computed ONCE per search instead of
+;; being re-filtered per candidate per pixel. The horizontal 6-tap sums are
+;; shared twice over: `half-h` is a rounding of them, and `center-j` is the
+;; vertical 6-tap OVER them — which is also the two-pass form FFmpeg's
+;; `h264_qpel_hv_lowpass` uses and that `center-j`'s note above describes.
+;;
+;; Reads of the reference plane, per macroblock, for the whole sub-pel stage:
+;; **529**, against ~231,000 before (49 candidates x 256 pixels x an average of
+;; 18.4 filter taps). Bit-identical: same formulas, same operand order, same
+;; intermediate widths, evaluated once rather than repeatedly. Contrast the
+;; support window that was tried and reverted (see the namespace docstring):
+;; that relocated reads, this removes them.
+
+(defn- window-idx [ww x y] (+ (* y ww) x))
+
+(defn subpel-planes
+  "Precompute the integer samples and the three half-sample planes covering
+   every position a sub-pel search around `(x0,y0)` can read: a
+   `(size+2)`-square region whose top-left is `(x0-1, y0-1)`.
+
+   Returns `{:s :b :h :j :n :ox :oy}` — flat `n`-square arrays of the integer
+   sample, half-h ('b'), half-v ('h') and centre 'j' values, with `:ox`/`:oy`
+   the picture coordinate of the region's top-left. `quarter-pel-from-planes`
+   reads them."
+  [plane w h x0 y0 size]
+  (let [n (+ size 2)
+        ox (dec x0) oy (dec y0)
+        ;; integer samples, extended by the 6-tap's -2/+3 reach on both axes
+        sw (+ n 5) sox (- ox 2) soy (- oy 2)
+        ^ints s-ext (new-window (* sw sw))
+        _ (dotimes [yy sw]
+            (let [row (* yy sw) py (+ soy yy)]
+              (dotimes [xx sw]
+                (aset s-ext (+ row xx) (int (sample plane w h (+ sox xx) py))))))
+        se (fn [x y] (aget s-ext (window-idx sw (- x sox) (- y soy))))
+        ;; unrounded horizontal 6-tap sums, n wide by (n+5) tall — reused by
+        ;; BOTH half-h (a rounding of them) and centre-j (a vertical 6-tap over
+        ;; them), which is where most of the saving comes from
+        hh (+ n 5) hoy (- oy 2)
+        ^ints hs (new-window (* n hh))
+        _ (dotimes [yy hh]
+            (let [row (* yy n) py (+ hoy yy)]
+              (dotimes [xx n]
+                (let [px (+ ox xx)]
+                  (aset hs (+ row xx)
+                        (int (+ (* 20 (+ (se px py) (se (inc px) py)))
+                                (* -5 (+ (se (dec px) py) (se (+ px 2) py)))
+                                (se (- px 2) py)
+                                (se (+ px 3) py))))))))
+        hsat (fn [xx y] (aget hs (+ (* (- y hoy) n) xx)))
+        ^ints s (new-window (* n n))
+        ^ints b (new-window (* n n))
+        ^ints hv (new-window (* n n))
+        ^ints j (new-window (* n n))]
+    (dotimes [yy n]
+      (let [row (* yy n) py (+ oy yy)]
+        (dotimes [xx n]
+          (let [px (+ ox xx) i (+ row xx)]
+            (aset s i (int (se px py)))
+            (aset b i (int (clip8 (bit-shift-right (+ (hsat xx py) 16) 5))))
+            (aset hv i (int (clip8 (bit-shift-right
+                                    (+ (* 20 (+ (se px py) (se px (inc py))))
+                                       (* -5 (+ (se px (dec py)) (se px (+ py 2))))
+                                       (se px (- py 2))
+                                       (se px (+ py 3))
+                                       16)
+                                    5))))
+            (aset j i (int (clip8 (bit-shift-right
+                                   (+ (* 20 (+ (hsat xx py) (hsat xx (inc py))))
+                                      (* -5 (+ (hsat xx (dec py)) (hsat xx (+ py 2))))
+                                      (hsat xx (- py 2))
+                                      (hsat xx (+ py 3))
+                                      512)
+                                   10))))))))
+    {:s s :b b :h hv :j j :n n :ox ox :oy oy}))
+
+(defn subpel-selector
+  "Resolve a quarter-sample fraction `(fx,fy)` into the plane lookups that
+   produce it, ONCE, so a caller evaluating a whole block does not re-decide it
+   per pixel: `{:a array :ao offset :b array-or-nil :bo offset}`, meaning
+   `avg1(a[i+ao], b[i+bo])`, or just `a[i+ao]` when `:b` is nil, where `i` is
+   the region index of the pixel.
+
+   Every one of §8.4.2.2.1 Figure 8-4's sixteen positions has exactly this
+   shape — an integer sample or a half-sample, or the rounded average of two of
+   them — with the only variation being WHICH plane and whether the second
+   operand comes from one column right (`+1`) or one row down (`+n`). Selecting
+   it once turns the per-pixel sixteen-way `cond` into two array reads.
+
+   Measured: after `subpel-planes` removed the plane reads from the sub-pel
+   search, that `cond` was what remained (49 candidates x 256 pixels per
+   macroblock, each walking up to sixteen tests)."
+  [{:keys [s b h j n]} fx fy]
+  (let [pair (fn [a ao bb bo] {:a a :ao ao :b bb :bo bo})
+        one (fn [a] {:a a :ao 0 :b nil :bo 0})
+        right 1
+        down n]
+    (cond
+      (and (zero? fx) (zero? fy)) (one s)
+      (and (= fx 2) (zero? fy)) (one b)
+      (and (zero? fx) (= fy 2)) (one h)
+      (and (= fx 2) (= fy 2)) (one j)
+      (and (= fx 1) (zero? fy)) (pair s 0 b 0)
+      (and (= fx 3) (zero? fy)) (pair s right b 0)
+      (and (zero? fx) (= fy 1)) (pair s 0 h 0)
+      (and (zero? fx) (= fy 3)) (pair s down h 0)
+      (and (= fx 1) (= fy 2)) (pair h 0 j 0)
+      (and (= fx 3) (= fy 2)) (pair j 0 h right)
+      (and (= fx 2) (= fy 1)) (pair b 0 j 0)
+      (and (= fx 2) (= fy 3)) (pair j 0 b down)
+      (and (= fx 1) (= fy 1)) (pair b 0 h 0)
+      (and (= fx 3) (= fy 1)) (pair b 0 h right)
+      (and (= fx 1) (= fy 3)) (pair h 0 b down)
+      (and (= fx 3) (= fy 3)) (pair h right b down)
+      :else (throw (ex-info "h264.interp: invalid luma quarter-pel fraction (must be 0..3)"
+                             {:fx fx :fy fy})))))
+
+(defn quarter-pel-from-planes
+  "`quarter-pel-luma` for a position inside a `subpel-planes` region, at
+   region-relative `(x,y)`. Convenience form — it resolves the fraction per
+   call, so a caller doing a whole block should hoist `subpel-selector` out of
+   its loop instead (`h264.encode/sad-mc-planes` does)."
+  [planes x y fx fy]
+  (let [{:keys [a ao b bo]} (subpel-selector planes fx fy)
+        i (window-idx (:n planes) x y)
+        ^ints a a]
+    (if (nil? b)
+      (aget a (+ i ao))
+      (let [^ints b b] (avg1 (aget a (+ i ao)) (aget b (+ i bo)))))))
 
 (defn mc-luma-block
   "Motion-compensated `size`x`size` luma block from reference `plane`
