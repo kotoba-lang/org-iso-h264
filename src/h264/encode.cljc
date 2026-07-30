@@ -124,7 +124,14 @@
          (vec (for [j (range (count (first B)))]
                 (reduce + (for [k (range (count B))] (* (get-in A [i k]) (get-in B [k j])))))))))
 
-(defn- mat-vec-mul [A v]
+;; `mat-vec-mul` and `round-nearest` are no longer on any encode path — both
+;; solves are folded to exact integers (`ac-solver-int`/`regular-solver-int`).
+;; They are kept because they ARE the rational reference the folds are asserted
+;; bit-identical against (`folded-integer-solve-is-bit-identical-to-the-rational-one`
+;; and its regular-solver twin), reached via `#'` from the tests, which
+;; clj-kondo cannot see. Deleting them would delete the only independent
+;; statement of what those folds are supposed to compute.
+(defn- ^{:clj-kondo/ignore [:unused-private-var]} mat-vec-mul [A v]
   (vec (for [row A] (reduce + (map * row v)))))
 
 (defn- mat-inverse
@@ -194,9 +201,11 @@
         (swap! ac-solver-cache assoc qp result)
         result)))
 
-(defn- round-nearest
+(defn- ^{:clj-kondo/ignore [:unused-private-var]} round-nearest
   "Round a real number (integer, Clojure ratio, or float/double) to the
-   nearest integer, ties away from negative infinity. Portable — no
+   nearest integer, ties away from negative infinity. Retained as part of the
+   rational reference the folded solves are checked against (see the note above
+   `mat-vec-mul`), not because any encode path still calls it. Portable — no
    `Math/` interop (this is a `.cljc` file; on ClojureScript `/` yields a
    double rather than an exact ratio, and this fn handles both uniformly
    via `mod`, which has floor semantics on both platforms)."
@@ -355,17 +364,57 @@
         (swap! regular-solver-cache assoc qp result)
         result)))
 
+(def ^:private regular-solver-int-cache (atom {}))
+
+(defn- regular-solver-int
+  "Memoized per-QP EXACT INTEGER form of the FULL 16-position regular solve —
+   the inter counterpart of `ac-solver-int`, folded the same way for the same
+   reason, over 16 rows instead of 15.
+
+   It exists because the intra fold was applied and the inter one was not, and
+   nobody noticed for the honest reason that **the P path had never been
+   measured**: `com-junkawasaki/root` ADR-2800002800's profile was taken with
+   `encode-idr-luma-frame`, which never reaches this function, while 1799 of an
+   episode's 1800 frames are P frames that reach it 16 times per macroblock.
+   Measured 2026-07-30, `solve-regular-levels` cost 258.30 us per 4x4 block
+   against the folded intra path's 13.46 us — 19x — with `inv`'s entries still
+   `Ratio`/`BigInt`, i.e. exactly the pre-fold arithmetic the intra path had
+   already been rescued from.
+
+   Returns `[{:num [16] :den D} x16]`, one entry per raster position."
+  [qp]
+  (or (@regular-solver-int-cache qp)
+      (let [[MT inv] (regular-solver qp)
+            rows (mapv row->int (mat-mul inv MT))]
+        (swap! regular-solver-int-cache assoc qp rows)
+        rows)))
+
 (defn- solve-regular-levels
   "Solve all 16 raster-position integer CAVLC levels for one 4x4 inter
    block's target pixel-domain residual (`target-flat`, 16 values, raster
-   idx=row*4+col), via `regular-solver`. Returns a 16-element vector indexed
-   by RASTER position directly (unlike `solve-ac-levels`, which is shifted
-   by 1 since it excludes the DC position)."
+   idx=row*4+col), via `regular-solver-int`. Returns a 16-element vector
+   indexed by RASTER position directly (unlike `solve-ac-levels`, which is
+   shifted by 1 since it excludes the DC position).
+
+   Bit-identical to the two-rational-matrix-product form it replaces —
+   asserted over every QP the spec allows in
+   `folded-regular-solve-is-bit-identical-to-the-rational-one`, for the same
+   reason the intra one is: this repo chose an exact solve over a memorized MF
+   table because the table leaked ~20% across coefficients against this
+   pipeline's ~2%, and a faster solve that changed the levels would be buying
+   that leakage back."
   [qp target-flat]
-  (let [[MT inv] (regular-solver qp)
-        rhs (mat-vec-mul MT target-flat)
-        sol (mat-vec-mul inv rhs)]
-    (mapv round-nearest sol)))
+  (let [rows (regular-solver-int qp)
+        t (vec target-flat)]
+    (loop [r 0 acc (transient [])]
+      (if (= r 16)
+        (persistent! acc)
+        (let [{:keys [num den]} (nth rows r)
+              p (loop [c 0 s 0]
+                  (if (= c 16)
+                    s
+                    (recur (inc c) (+ s (* (long (nth num c)) (long (nth t c)))))))]
+          (recur (inc r) (conj! acc (round-div p den))))))))
 
 (defn- regular-dequant-raster
   "Given 16 raster-position integer levels (from `solve-regular-levels`) and

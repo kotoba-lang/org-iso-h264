@@ -265,6 +265,74 @@
           (is (= (rational-solve qp t) (@solve qp t))
               (str "levels diverged at qp " qp " for " (pr-str t))))))))
 
+(deftest ^:parallel folded-regular-solve-is-bit-identical-to-the-rational-one
+  ;; The same fold, on the INTER (regular, all-16-position) solver — which was
+  ;; left un-folded for a year of measurements because the profile that drove
+  ;; the intra fold was taken on an intra frame, and this function is only
+  ;; reached from the P path. Measured 2026-07-30: 258.30 us per 4x4 block
+  ;; against the folded intra path's 13.46 us, with `inv` still carrying
+  ;; Ratio/BigInt entries.
+  ;;
+  ;; Same standard of proof as the intra one, and for the same reason: the
+  ;; levels must be UNCHANGED, not merely close, or the exact solve this repo
+  ;; deliberately chose over a memorized MF table stops being exact.
+  (let [regular-solver #'h264.encode/regular-solver
+        mat-vec-mul #'h264.encode/mat-vec-mul
+        round-nearest #'h264.encode/round-nearest
+        solve #'h264.encode/solve-regular-levels
+        rational-solve (fn [qp t]
+                         (let [[MT inv] (@regular-solver qp)]
+                           (mapv @round-nearest
+                                 (@mat-vec-mul inv (@mat-vec-mul MT t)))))
+        rng (java.util.Random. 20260731)]
+    (doseq [qp (range 0 52)]
+      (testing (str "qp " qp)
+        (doseq [t (concat
+                   (repeatedly 20 #(vec (repeatedly 16 (fn [] (- (.nextInt rng 1024) 512)))))
+                   [(vec (repeat 16 0))
+                    (vec (repeat 16 255))
+                    (vec (repeat 16 -255))
+                    (vec (repeat 16 512))
+                    (vec (repeat 16 -512))
+                    (vec (map-indexed (fn [i _] (if (even? i) 512 -512)) (range 16)))
+                    (assoc (vec (repeat 16 0)) 0 511)
+                    (assoc (vec (repeat 16 0)) 15 -511)])]
+          (is (= (rational-solve qp t) (@solve qp t))
+              (str "levels diverged at qp " qp " for " (pr-str t))))))))
+
+(deftest ^:parallel folded-regular-solve-keeps-the-accumulator-inside-a-long
+  ;; The same check as the intra fold's, but the bound had to be MEASURED for
+  ;; this matrix rather than inherited from it — and the first version of this
+  ;; test failed for exactly that reason, asserting the AC path's 2^50 floor
+  ;; against numbers nowhere near it.
+  ;;
+  ;; The regular solver includes the DC column that `ac-solver` deliberately
+  ;; excludes, and a 16x16 `M^T·M` is far better conditioned than the
+  ;; DC-punctured 15x16 one, so its inverse carries much smaller denominators:
+  ;; worst accumulator 18,957,811,712 (~2^34.1) across qp 0..51 with
+  ;; |target| <= 512, against the AC path's ~2^54. This path therefore has ~28
+  ;; bits of headroom in a long instead of 9, and — unlike the AC path — sits
+  ;; comfortably inside a ClojureScript double's 53-bit mantissa too.
+  ;;
+  ;; The floor below is set just under the measured value so that a change
+  ;; which silently shrank these numbers (a truncation, a wrong matrix) would
+  ;; be noticed rather than quietly passing the ceiling.
+  (let [regular-solver-int #'h264.encode/regular-solver-int
+        worst (atom 0)]
+    (doseq [qp (range 0 52)
+            {:keys [num den]} (@regular-solver-int qp)]
+      (is (pos? den) (str "denominator must be positive at qp " qp))
+      (is (= 16 (count num)))
+      (swap! worst max (* 2 16 512 (apply max (map #(abs (long %)) num)))))
+    (is (< @worst (bit-shift-left 1 62))
+        (str "worst accumulator " @worst " must stay inside a long"))
+    (is (< @worst (bit-shift-left 1 53))
+        (str "worst accumulator " @worst " also fits a cljs double's mantissa, "
+             "unlike the AC path's — do not let that regress silently"))
+    (is (>= @worst (bit-shift-left 1 30))
+        (str "worst accumulator " @worst " dropped far below the measured "
+             "~2^34 — the matrix or the fold changed, re-derive the bound"))))
+
 (deftest ^:parallel folded-solve-keeps-the-accumulator-inside-a-long
   ;; The per-row denominator is not an aesthetic choice: a matrix-wide common
   ;; denominator pushes the worst-case accumulator to 62 bits (qp 5), leaving
