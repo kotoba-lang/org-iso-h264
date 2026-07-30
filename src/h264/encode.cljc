@@ -1015,51 +1015,33 @@
    search."
   (inc (* 256 255)))
 
-(defn- sad-mc
-  "SAD between `src` (a `size`x`size` row-vector grid) and the
-   motion-compensated reference block at `mv`, computed WITHOUT materialising
-   the predicted block, and abandoned as soon as the running sum exceeds
-   `cutoff` (the returned value is then > `cutoff` but otherwise meaningless).
-
-   Two savings over `sad` on `interp/mc-luma-block`'s output, both structural
-   rather than arithmetic — the per-sample interpolation is the same call:
-
-   - no `size`x`size` grid is allocated per candidate, and motion estimation
-     throws away every candidate but one
-   - a candidate already worse than the best so far stops early, usually within
-     a row or two
-
-   The cutoff is tested per ROW, not per sample: a hopeless candidate exceeds it
-   in the first row or two either way, and a per-sample test would add a branch
-   to the inner loop to save little.
-
-   `>` rather than `>=` is deliberate. A candidate whose SAD EQUALS the best so
-   far must be allowed to finish, because `apply min-key` — which this replaces
-   in `me-full-search`/`me-subpel-refine` — keeps the LAST minimum on a tie
-   (verified against `min-key` directly, not assumed), so aborting ties would
-   silently change which motion vector the search picks, and with it the encoded
-   bitstream."
-  [src ref-luma w h x0 y0 [mvx mvy] size cutoff]
-  (let [ix (bit-shift-right mvx 2) fx (bit-and mvx 3)
-        iy (bit-shift-right mvy 2) fy (bit-and mvy 3)
-        bx (+ x0 ix) by (+ y0 iy)]
-    (loop [ry 0 acc 0]
-      (if (or (= ry size) (> acc cutoff))
-        acc
-        (let [srow (nth src ry)
-              py (+ by ry)]
-          (recur (inc ry)
-                 (loop [rx 0 s acc]
-                   (if (= rx size)
-                     s
-                     (let [d (- (long (nth srow rx))
-                                (long (interp/quarter-pel-luma ref-luma w h (+ bx rx) py fx fy)))]
-                       (recur (inc rx) (+ s (if (neg? d) (- d) d))))))))))))
+;; --- fused, early-abandoning SAD for motion estimation ------------------
+;;
+;; Both of these compute the SAD between the source block and a candidate
+;; WITHOUT materialising the candidate, and abandon it as soon as the running
+;; sum exceeds `cutoff` (the returned value is then > cutoff but otherwise
+;; meaningless). Two savings over `sad` on an `interp/mc-luma-block` grid, both
+;; structural: no grid is allocated per candidate (motion estimation discards
+;; every candidate but one), and a candidate already worse than the best so far
+;; stops after a row or two.
+;;
+;; The cutoff is tested per ROW, not per sample: a hopeless candidate exceeds it
+;; within a row or two either way, and a per-sample test would add a branch to
+;; the inner loop to save little.
+;;
+;; `>` rather than `>=` is deliberate in BOTH. A candidate whose SAD EQUALS the
+;; best so far must be allowed to finish, because `apply min-key` — which
+;; `best-mv` replaces — keeps the LAST minimum on a tie (verified against
+;; `min-key` directly, not assumed), so abandoning ties would silently change
+;; which motion vector the search picks, and with it the encoded bitstream.
+;;
+;; There is deliberately NO general any-fraction version. There was one, and it
+;; became dead the moment both searches got the form specialised for the
+;; positions they actually visit: whole-pel for the integer search,
+;; a prepared plane region for the sub-pel one.
 
 (defn- sad-mc-planes
-  "`sad-mc` against a prepared `interp/subpel-planes` region instead of the
-   reference plane: same fused accumulation, same per-row cutoff, same `>`
-   rather than `>=` so ties still finish (see `sad-mc`). `(rx,ry)` is the
+  "Fused SAD against a prepared `interp/subpel-planes` region. `(rx,ry)` is the
    candidate block's top-left in region coordinates.
 
    The fraction is resolved ONCE via `interp/subpel-selector`, so the inner loop
@@ -1089,19 +1071,69 @@
                            d (- (long (nth srow col)) (long p))]
                        (recur (inc col) (+ s (if (neg? d) (- d) d))))))))))))
 
-(defn- best-mv
-  "Pick the motion vector minimizing `sad-mc`, over `candidates` (each a
-   quarter-sample `[mvx mvy]`), threading the best-so-far in as the cutoff.
+(defn- sad-mc-integer
+  "Fused SAD for a WHOLE-pel motion vector: there is no interpolation at that
+   position, only the boundary-clamped reference sample, so this reads the plane
+   directly instead of entering the general quarter-sample entry point to arrive
+   at the same single read.
 
-   Replaces `apply min-key` and must agree with it exactly: candidates are
-   visited in the given order and the best is replaced on `<=`, so a tie keeps
-   the LAST one, which is what `min-key` does."
-  [src ref-luma w h x0 y0 size candidates]
+   Worth specialising because every one of `me-full-search`'s candidates is
+   whole-pel — 289 of the 338 a macroblock evaluates at the default search
+   range — and after the sub-pel search was fixed the integer search became the
+   largest single stage of a P frame (~33%, measured by caller attribution).
+
+   Two things are hoisted out of the inner loop. The row's base index is
+   computed once per row rather than once per sample. And the common case where
+   the whole row segment lies inside the picture is tested once per BLOCK, after
+   which no clamping happens at all — which is bit-identical because clamping an
+   in-range coordinate is the identity, and the clamped branch is still there for
+   blocks that really do hang off an edge.
+
+   Same per-row cutoff and tie handling as `sad-mc-planes` — see the section
+   comment above it."
+  [src ref-luma w h bx by size cutoff]
+  (let [interior-x? (and (>= bx 0) (<= (+ bx size) w))]
+    (loop [row 0 acc 0]
+      (if (or (= row size) (> acc cutoff))
+        acc
+        (let [srow (nth src row)
+              py (+ by row)
+              cy (if (neg? py) 0 (if (>= py h) (dec h) py))
+              base (* cy w)]
+          (recur (inc row)
+                 (if interior-x?
+                   (let [off (+ base bx)]
+                     (loop [col 0 s acc]
+                       (if (= col size)
+                         s
+                         (let [d (- (long (nth srow col)) (long (nth ref-luma (+ off col))))]
+                           (recur (inc col) (+ s (if (neg? d) (- d) d)))))))
+                   (loop [col 0 s acc]
+                     (if (= col size)
+                       s
+                       (let [px (+ bx col)
+                             cx (if (neg? px) 0 (if (>= px w) (dec w) px))
+                             d (- (long (nth srow col)) (long (nth ref-luma (+ base cx))))]
+                         (recur (inc col) (+ s (if (neg? d) (- d) d)))))))))))))
+
+(defn- best-mv
+  "Pick the motion vector minimizing `cost-fn` over `candidates`, threading the
+   best-so-far in as the cutoff. `cost-fn` is `(fn [mv cutoff] cost)`, so the
+   integer and sub-pel searches can each use the SAD specialised for their
+   positions while the selection rule stays in one place.
+
+   That matters because the selection rule is the subtle part: this replaces
+   `apply min-key` and must agree with it exactly. Candidates are visited in the
+   given order and the best is replaced on `<=`, so a tie keeps the LAST one,
+   which is what `min-key` does (verified against `min-key` directly, and pinned
+   by `h264.me-test`'s all-candidates-tie case). Having two copies of this loop
+   would be two chances to get that wrong."
+  [candidates cost-fn]
   (loop [cs (seq candidates) chosen nil best no-sad-cutoff]
     (if-not cs
       chosen
       (let [mv (first cs)
-            cost (sad-mc src ref-luma w h x0 y0 mv size best)]
+            cost (cost-fn mv best)]
         (if (<= cost best)
           (recur (next cs) mv cost)
           (recur (next cs) chosen best))))))
@@ -1118,7 +1150,14 @@
         candidates (for [dy (range (- search-range) (inc search-range))
                          dx (range (- search-range) (inc search-range))]
                      [(* dx 4) (* dy 4)])]
-    (best-mv src ref-luma w h x0 y0 16 candidates)))
+    ;; Every candidate here is whole-pel by construction, so no interpolation
+    ;; is reachable — `sad-mc-integer` reads the plane directly.
+    (best-mv candidates
+             (fn [[mvx mvy] cutoff]
+               (sad-mc-integer src ref-luma w h
+                               (+ x0 (bit-shift-right mvx 2))
+                               (+ y0 (bit-shift-right mvy 2))
+                               16 cutoff)))))
 
 (defn- me-subpel-refine
   "Quarter-pel LOCAL refinement around `best-mv` (already a multiple of 4,
@@ -1141,19 +1180,15 @@
         planes (interp/subpel-planes ref-luma w h (+ x0 bix) (+ y0 biy) 16)
         candidates (for [dmy (range -3 4) dmx (range -3 4)]
                      [(+ base-mvx dmx) (+ base-mvy dmy)])]
-    (loop [cs (seq candidates) chosen nil best no-sad-cutoff]
-      (if-not cs
-        chosen
-        (let [[mvx mvy :as mv] (first cs)
-              ;; region-relative top-left of this candidate's block: the region
-              ;; starts one integer sample before the base position, and a
-              ;; candidate's integer part is either the base's or one less.
-              rx (- (bit-shift-right mvx 2) bix -1)
-              ry (- (bit-shift-right mvy 2) biy -1)
-              cost (sad-mc-planes src planes rx ry (bit-and mvx 3) (bit-and mvy 3) 16 best)]
-          (if (<= cost best)
-            (recur (next cs) mv cost)
-            (recur (next cs) chosen best)))))))
+    (best-mv candidates
+             (fn [[mvx mvy] cutoff]
+               ;; region-relative top-left of this candidate's block: the region
+               ;; starts one integer sample before the base position, and a
+               ;; candidate's integer part is either the base's or one less.
+               (sad-mc-planes src planes
+                              (- (bit-shift-right mvx 2) bix -1)
+                              (- (bit-shift-right mvy 2) biy -1)
+                              (bit-and mvx 3) (bit-and mvy 3) 16 cutoff)))))
 
 (def ^:private inter-cbp->golomb
   "Reverse lookup of `h264.decode/golomb-to-inter-cbp` — given an actual
