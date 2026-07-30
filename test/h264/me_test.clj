@@ -62,6 +62,15 @@
            (for [dmy (range -3 4) dmx (range -3 4)] [(+ bmx dmx) (+ bmy dmy)]))))
 
 (defn- plane [w h f] (vec (for [y (range h) x (range w)] (f x y))))
+
+;; The searches now take an ARRAY plane and an ARRAY source block, because
+;; measurement said the representation was 16.6x of the SAD kernel (see
+;; `h264.interp/plane->array`). The reference implementations below deliberately
+;; stay on vectors — they are the independent statement of what the answer
+;; should be, and rewriting them the same way would make them agree by
+;; construction rather than by being right.
+(defn- as-plane [v] (int-array v))
+(defn- as-block [grid] (int-array (mapcat identity grid)))
 (defn- grid-16 [plane w x0 y0]
   (vec (for [ry (range 16)]
          (let [row (* (+ y0 ry) w)]
@@ -81,7 +90,7 @@
           rf (ref-frame-of ref-plane)]
       (doseq [mb-y (range 2 4) mb-x (range 2 4)]
         (let [src (grid-16 src-plane w (* mb-x 16) (* mb-y 16))
-              got (me-full-search src rf mb-x mb-y 3)
+              got (me-full-search (as-block src) (as-plane ref-plane) w h mb-x mb-y 3)
               want (reference-full-search src rf mb-x mb-y 3)]
           (is (= want got) (str "mb " mb-x "," mb-y)))))))
 
@@ -94,11 +103,11 @@
           rf (ref-frame-of ref-plane)]
       (doseq [mb-y (range 2 4) mb-x (range 2 4)]
         (let [src (grid-16 src-plane w (* mb-x 16) (* mb-y 16))
-              got (me-full-search src rf mb-x mb-y 4)]
+              got (me-full-search (as-block src) (as-plane ref-plane) w h mb-x mb-y 4)]
           (is (= (reference-full-search src rf mb-x mb-y 4) got))
           (testing "and the sub-pel refinement agrees too"
             (is (= (reference-subpel-refine src rf mb-x mb-y got)
-                   (me-subpel-refine src rf mb-x mb-y got)))))))))
+                   (me-subpel-refine (as-block src) (as-plane ref-plane) w h mb-x mb-y got)))))))))
 
 (deftest flat-source-every-candidate-ties
   (testing "on a uniform plane EVERY candidate has the same SAD, so the choice is decided entirely by the tie rule — apply min-key keeps the LAST, and so must the fused search"
@@ -107,7 +116,7 @@
           src (grid-16 flat w 32 32)]
       (doseq [sr [1 2 3]]
         (let [want (reference-full-search src rf 2 2 sr)
-              got (me-full-search src rf 2 2 sr)]
+              got (me-full-search (as-block src) (as-plane flat) w h 2 2 sr)]
           (is (= want got) (str "search-range " sr))
           (testing "and that answer is the LAST candidate, not the first — i.e. the tie rule is real, not coincidence"
             (is (= [(* sr 4) (* sr 4)] want))))))))
@@ -121,5 +130,5 @@
       (doseq [mb-y (range 2 4) mb-x (range 2 4) sr [2 4]]
         (let [src (grid-16 src-plane w (* mb-x 16) (* mb-y 16))]
           (is (= (reference-full-search src rf mb-x mb-y sr)
-                 (me-full-search src rf mb-x mb-y sr))
+                 (me-full-search (as-block src) (as-plane ref-plane) w h mb-x mb-y sr))
               (str "mb " mb-x "," mb-y " sr " sr)))))))

@@ -1048,7 +1048,7 @@
    is two array reads and an average rather than a sixteen-way `cond` per
    pixel — which is what dominated once `subpel-planes` had removed the
    reference-plane reads."
-  [src planes rx ry fx fy size cutoff]
+  [^ints src planes rx ry fx fy size cutoff]
   (let [n (long (:n planes))
         {:keys [a ao b bo]} (interp/subpel-selector planes fx fy)
         ^ints a a
@@ -1058,7 +1058,7 @@
     (loop [row 0 acc 0]
       (if (or (= row size) (> acc cutoff))
         acc
-        (let [srow (nth src row)
+        (let [srow (* row size)
               i0 (+ base (* row n))]
           (recur (inc row)
                  (loop [col 0 s acc]
@@ -1068,7 +1068,7 @@
                            p (if two?
                                (bit-shift-right (+ (aget a (+ i ao)) (aget bb (+ i bo)) 1) 1)
                                (aget a (+ i ao)))
-                           d (- (long (nth srow col)) (long p))]
+                           d (- (aget src (+ srow col)) p)]
                        (recur (inc col) (+ s (if (neg? d) (- d) d))))))))))))
 
 (defn- sad-mc-integer
@@ -1091,12 +1091,12 @@
 
    Same per-row cutoff and tie handling as `sad-mc-planes` — see the section
    comment above it."
-  [src ref-luma w h bx by size cutoff]
+  [^ints src ^ints ref-luma w h bx by size cutoff]
   (let [interior-x? (and (>= bx 0) (<= (+ bx size) w))]
     (loop [row 0 acc 0]
       (if (or (= row size) (> acc cutoff))
         acc
-        (let [srow (nth src row)
+        (let [srow (* row size)
               py (+ by row)
               cy (if (neg? py) 0 (if (>= py h) (dec h) py))
               base (* cy w)]
@@ -1106,14 +1106,14 @@
                      (loop [col 0 s acc]
                        (if (= col size)
                          s
-                         (let [d (- (long (nth srow col)) (long (nth ref-luma (+ off col))))]
+                         (let [d (- (aget src (+ srow col)) (aget ref-luma (+ off col)))]
                            (recur (inc col) (+ s (if (neg? d) (- d) d)))))))
                    (loop [col 0 s acc]
                      (if (= col size)
                        s
                        (let [px (+ bx col)
                              cx (if (neg? px) 0 (if (>= px w) (dec w) px))
-                             d (- (long (nth srow col)) (long (nth ref-luma (+ base cx))))]
+                             d (- (aget src (+ srow col)) (aget ref-luma (+ base cx)))]
                          (recur (inc col) (+ s (if (neg? d) (- d) d)))))))))))))
 
 (defn- best-mv
@@ -1144,9 +1144,8 @@
    by (dx,dy) pixels, for dx,dy in `[-search-range,search-range]`. Returns
    the best MV in QUARTER-luma-sample units (always a multiple of 4 in both
    components — sub-pel refinement is `me-subpel-refine`'s job)."
-  [src ref-frame mb-x mb-y search-range]
-  (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
-        x0 (* mb-x 16) y0 (* mb-y 16)
+  [src ref-luma w h mb-x mb-y search-range]
+  (let [x0 (* mb-x 16) y0 (* mb-y 16)
         candidates (for [dy (range (- search-range) (inc search-range))
                          dx (range (- search-range) (inc search-range))]
                      [(* dx 4) (* dy 4)])]
@@ -1167,9 +1166,8 @@
    non-multiple-of-4 (half/quarter-pel) motion vectors are a normal outcome
    of this step, motion-compensated via the SAME `h264.interp` sub-pel path
    `h264.decode/mc-predict` uses for decode."
-  [src ref-frame mb-x mb-y integer-mv]
-  (let [w (:width ref-frame) h (:height ref-frame) ref-luma (:luma ref-frame)
-        x0 (* mb-x 16) y0 (* mb-y 16)
+  [src ref-luma w h mb-x mb-y integer-mv]
+  (let [x0 (* mb-x 16) y0 (* mb-y 16)
         [base-mvx base-mvy] integer-mv
         bix (bit-shift-right base-mvx 2)
         biy (bit-shift-right base-mvy 2)
@@ -1197,6 +1195,20 @@
    permutation (`golomb-to-inter-cbp` is cross-checked there to be a full
    permutation of 0..47, so this reverse map is total over that domain)."
   (zipmap decode/golomb-to-inter-cbp (range 48)))
+
+(defn- grid->array
+  "Flatten a `size`x`size` row-vector block into a dense integer array, so
+   motion estimation's inner loops read it with `aget` rather than two `nth`
+   calls. Measured 16.6x on this repo's own 16x16 SAD — see
+   `interp/plane->array`."
+  [grid]
+  (let [rows (count grid) cols (count (first grid))
+        ^ints out #?(:clj (int-array (* rows cols)) :cljs (make-array (* rows cols)))]
+    (dotimes [r rows]
+      (let [row (nth grid r) base (* r cols)]
+        (dotimes [c cols]
+          (aset out (+ base c) (int (nth row c))))))
+    out))
 
 (defn- mb-block
   "Extract the `size`x`size` sub-grid for macroblock (`mb-x`,`mb-y`) from a
@@ -1346,7 +1358,12 @@
    `encode-p-skip-macroblock!`/`encode-inter-16x16-macroblock!` both
    return)."
   [w qp qpc mb-width mb-height ref-frame luma-grid cb-grid cr-grid search-range]
-  (let [num-mb (* mb-width mb-height)]
+  (let [num-mb (* mb-width mb-height)
+        ;; ONE conversion per frame, against ~10^6 reads of it in motion
+        ;; estimation. See `interp/plane->array` for the measurement.
+        ref-w (:width ref-frame)
+        ref-h (:height ref-frame)
+        ref-luma-arr (interp/plane->array (:luma ref-frame))]
     (loop [addr 0 states [] skip-run 0]
       (if (= addr num-mb)
         (do (eg/write-ue! w skip-run) states)
@@ -1356,6 +1373,9 @@
               topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
               topright-mb (when (and (pos? mb-y) (< (inc mb-x) mb-width)) (nth states (+ (- addr mb-width) 1)))
               src (mb-block luma-grid mb-x mb-y 16)
+              ;; the residual/entropy path keeps the row-vector grid; motion
+              ;; estimation gets the same 256 samples as a flat array
+              src-arr (grid->array src)
               src-cb (mb-block cb-grid mb-x mb-y 8)
               src-cr (mb-block cr-grid mb-x mb-y 8)
               mvp (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0)
@@ -1365,8 +1385,8 @@
           (if (zero? skip-sad)
             (let [state (encode-p-skip-macroblock! qp mb-x mb-y ref-frame skip-mv)]
               (recur (inc addr) (conj states state) (inc skip-run)))
-            (let [best-int-mv (me-full-search src ref-frame mb-x mb-y search-range)
-                  best-mv (me-subpel-refine src ref-frame mb-x mb-y best-int-mv)
+            (let [best-int-mv (me-full-search src-arr ref-luma-arr ref-w ref-h mb-x mb-y search-range)
+                  best-mv (me-subpel-refine src-arr ref-luma-arr ref-w ref-h mb-x mb-y best-int-mv)
                   _ (eg/write-ue! w skip-run)
                   state (encode-inter-16x16-macroblock! w src src-cb src-cr qp qpc mb-x mb-y left-mb top-mb ref-frame best-mv mvp)]
               (recur (inc addr) (conj states state) 0))))))))
