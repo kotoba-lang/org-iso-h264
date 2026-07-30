@@ -114,6 +114,36 @@
         cy (max 0 (min (dec h) y))]
     (nth plane (+ (* cy w) cx))))
 
+(defn plane->array
+  "Copy a flat row-major plane into a dense integer array.
+
+   Motion estimation reads the reference plane on the order of a million times
+   per frame, and a Clojure vector read is a bounds check, a trie walk and an
+   unbox where an array read is one load. MEASURED on this repo's own 16x16 SAD,
+   same numbers, changing only the representation:
+
+     vector-of-row-vectors + nth   3051 ns/SAD   11.92 ns/px
+     flat persistent vector + nth  4051 ns/SAD   15.83 ns/px
+     int-array + aget               183 ns/SAD    0.72 ns/px   (16.6x)
+
+   Converting is O(w*h) and happens ONCE per frame, against ~10^6 reads of it —
+   which is the whole difference from the support-window scheme that was tried
+   and reverted (see the namespace docstring): that COPIED plane data per
+   candidate block and added work, this changes the representation the reads go
+   through and removes work."
+  [plane]
+  #?(:clj (int-array plane) :cljs (into-array plane)))
+
+(defn- sample-arr
+  "`sample`, but reading an array plane. Separate rather than making `sample`
+   itself array-only because `sample` is on the decoder's path too, and the
+   `^ints` hint that makes `aget` non-reflective cannot be satisfied by a
+   caller passing a vector."
+  [^ints plane w h x y]
+  (let [cx (max 0 (min (dec w) x))
+        cy (max 0 (min (dec h) y))]
+    (aget plane (+ (* cy w) cx))))
+
 (defn- new-window
   "Dense integer array of `n` entries, for the precomputed planes below.
    `aget`/`aset` on it MUST be reached through an `^ints`-hinted local or
@@ -254,7 +284,12 @@
    Returns `{:s :b :h :j :n :ox :oy}` — flat `n`-square arrays of the integer
    sample, half-h ('b'), half-v ('h') and centre 'j' values, with `:ox`/`:oy`
    the picture coordinate of the region's top-left. `quarter-pel-from-planes`
-   reads them."
+   reads them.
+
+   `plane` must be an ARRAY (`plane->array`), not a vector — this is the one
+   entry point in this namespace with that requirement, because it is the only
+   one motion estimation calls per macroblock and therefore the only one where
+   the representation shows up in the profile."
   [plane w h x0 y0 size]
   (let [n (+ size 2)
         ox (dec x0) oy (dec y0)
@@ -264,7 +299,7 @@
         _ (dotimes [yy sw]
             (let [row (* yy sw) py (+ soy yy)]
               (dotimes [xx sw]
-                (aset s-ext (+ row xx) (int (sample plane w h (+ sox xx) py))))))
+                (aset s-ext (+ row xx) (int (sample-arr plane w h (+ sox xx) py))))))
         se (fn [x y] (aget s-ext (window-idx sw (- x sox) (- y soy))))
         ;; unrounded horizontal 6-tap sums, n wide by (n+5) tall — reused by
         ;; BOTH half-h (a rounding of them) and centre-j (a vertical 6-tap over
