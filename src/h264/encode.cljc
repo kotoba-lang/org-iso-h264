@@ -439,8 +439,20 @@
    4x4 block) for luma 4x4 block index `b` (`h264.decode/blk->col-row`
    spatial convention) from a 16x16 `residual` grid."
   [residual b]
-  (let [[col row] (decode/blk->col-row b)]
-    (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in residual [(+ (* row 4) ry) (+ (* col 4) rx)])))))))
+  ;; Direct row `nth` + a literal row vector rather than nested `for` and
+  ;; `get-in`. get-in walked two levels with boxing 16 times per block and the
+  ;; comprehension allocated five lazy seqs; at 57,600 calls per frame that
+  ;; was 214 ms (measured 2026-07-30). Same values out.
+  (let [[col row] (decode/blk->col-row b)
+        r0 (* row 4)
+        c0 (* col 4)]
+    (loop [ry 0 acc (transient [])]
+      (if (= ry 4)
+        (persistent! acc)
+        (let [src (nth residual (+ r0 ry))]
+          (recur (inc ry)
+                 (conj! acc [(nth src c0) (nth src (+ c0 1))
+                             (nth src (+ c0 2)) (nth src (+ c0 3))])))))))
 
 (defn- chroma-block-residual
   "Extract the 4x4 pixel-domain residual (raster idx=row*4+col within the
@@ -449,8 +461,17 @@
    convention as luma's `blk->col-row`, see that def's docstring) from an
    8x8 `residual` grid (one Cb or Cr component)."
   [residual b]
-  (let [[col row] (decode/chroma-blk->col-row b)]
-    (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in residual [(+ (* row 4) ry) (+ (* col 4) rx)])))))))
+  ;; Same rewrite as `block-residual` above, same reason.
+  (let [[col row] (decode/chroma-blk->col-row b)
+        r0 (* row 4)
+        c0 (* col 4)]
+    (loop [ry 0 acc (transient [])]
+      (if (= ry 4)
+        (persistent! acc)
+        (let [src (nth residual (+ r0 ry))]
+          (recur (inc ry)
+                 (conj! acc [(nth src c0) (nth src (+ c0 1))
+                             (nth src (+ c0 2)) (nth src (+ c0 3))])))))))
 
 (defn- choose-chroma-pred-mode
   "Simplified Intra_Chroma mode decision (same style/scope as
