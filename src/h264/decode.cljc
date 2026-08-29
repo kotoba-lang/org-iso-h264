@@ -14,10 +14,13 @@
      multi-slice, no P/B slices, no multiple reference frames, no
      multi-frame GOP structure.
    - **Baseline profile, CAVLC only** (no CABAC).
-   - **mb_type: Intra_16x16 ONLY** (`mb_type` 1..24). `mb_type` 0
-     (`I_NxN`/Intra_4x4/Intra_8x8, requiring per-4x4-block adaptive
-     prediction-mode signaling) and 25 (`I_PCM`) THROW rather than being
-     silently mis-decoded.
+   - **mb_type: Intra_16x16 (1..24) and `I_NxN`/Intra_4x4 (0)**. Intra_4x4
+     is CAVLC-I-slice only (`decode-intra-4x4-macroblock-body!`, all nine
+     §8.3.1.2 modes + the §8.3.1.1 neighbour-derived predicted mode); the
+     CABAC path and a P-slice's intra macroblocks still refuse mb_type 0.
+     **Intra_8x8** — the other thing mb_type 0 can mean, needing the 8x8
+     transform and the §8.3.2.2 reference-sample filter — and 25 (`I_PCM`)
+     THROW rather than being silently mis-decoded.
    - **Intra_16x16 luma prediction modes: DC/Vertical/Horizontal (0/1/2)
      only** — mode 3 (Plane) throws.
    - **Chroma (Cb/Cr): ChromaArrayType 1 (4:2:0) only, DC/Horizontal/
@@ -139,13 +142,23 @@
 
 (defn- i16x16-mb-info
   "mb_type (1..24, I_16x16_*) → {:pred-mode :cbp-luma :cbp-chroma} per
-   Table 7-11. Throws for mb_type 0 (I_NxN) / 25 (I_PCM) / anything else
-   (out of scope, see namespace docstring)."
+   Table 7-11. Throws for mb_type 0 (I_NxN) / 25 (I_PCM) / anything else.
+
+   mb_type 0 reaching THIS function is not the general 'I_NxN is
+   unsupported' case any more — Intra_4x4 is implemented, in
+   `decode-intra-4x4-macroblock-body!`, and the CAVLC I-slice entry point
+   (`decode-macroblock!`) dispatches mb_type 0 there before ever calling
+   this. What still lands here is the two paths that have NOT been wired
+   up: the CABAC I-slice path (`decode-intra-macroblock-body-cabac!`,
+   whose §9.3.3.1.1.x context models for the pred-mode flags and the intra
+   `coded_block_pattern` are not implemented) and a P-slice's intra
+   macroblocks (`decode-macroblock-p!`, Table 7-13's `p_mb_type - 5`). The
+   reason literal says so rather than claiming Intra_4x4 does not exist."
   [mb-type]
   (when (or (zero? mb-type) (= mb-type 25) (> mb-type 25))
-    (throw (ex-info "h264.decode: only Intra_16x16 mb_type (1..24) is supported"
+    (throw (ex-info "h264.decode: only Intra_16x16 mb_type (1..24) is supported on this path"
                      {:mb-type mb-type
-                      :reason (cond (zero? mb-type) "I_NxN (Intra_4x4/8x8) not implemented"
+                      :reason (cond (zero? mb-type) "I_NxN (Intra_4x4) is implemented for CAVLC I-slices only; not for CABAC or P-slice intra macroblocks"
                                     (= mb-type 25) "I_PCM not implemented"
                                     :else "not a valid I-slice mb_type")})))
   (let [m (dec mb-type)]
@@ -292,6 +305,36 @@
    (0..2)}."
   [r]
   (let [cbp (nth golomb-to-inter-cbp (eg/ue! r))]
+    {:cbp-luma (mod cbp 16) :cbp-chroma (quot cbp 16)}))
+
+;; --- coded_block_pattern, INTRA column (§9.1.2 Table 9-4's
+;;     Intra_4x4/Intra_8x8 column for ChromaArrayType 1/2) — a DIFFERENT
+;;     permutation than `golomb-to-inter-cbp` above. Reading the inter
+;;     table for an I_NxN macroblock does not throw and does not desync
+;;     immediately: it yields a WRONG but structurally valid cbp, so the
+;;     decoder reads the wrong NUMBER of residual blocks and the bit reader
+;;     desyncs a few blocks later with plausible-looking garbage. This
+;;     table is only reachable from `read-coded-block-pattern-intra!`
+;;     (I_NxN); Intra_16x16 mb_types still infer their cbp from mb_type
+;;     itself (`i16x16-mb-info`) and read no me(v) at all. Transcribed from
+;;     FFmpeg's `ff_h264_golomb_to_intra4x4_cbp` (`libavcodec/h264data.c`),
+;;     a direct transcription of Table 9-4's Intra column; like the inter
+;;     table it is cross-checked at load time to be a full permutation of
+;;     0..47 (see `cbp-tables-are-permutations`, asserted in
+;;     test/h264/decode_test.clj) — a transcription typo that duplicated or
+;;     dropped a value would otherwise only show up as a decode mismatch.
+(def golomb-to-intra-cbp
+  [47 31 15  0 23 27 29 30  7 11 13 14 39 43 45 46
+   16  3  5 10 12 19 21 26 28 35 37 42 44  1  2  4
+    8 17 18 20 24  6  9 22 25 32 33 34 36 40 38 41])
+
+(defn- read-coded-block-pattern-intra!
+  "Read `coded_block_pattern` (§7.3.5.1, `me(v)`) for an I_NxN (Intra_4x4)
+   macroblock: a plain ue(v) codeNum mapped via `golomb-to-intra-cbp`.
+   Returns the same {:cbp-luma :cbp-chroma} shape as
+   `read-coded-block-pattern-inter!`."
+  [r]
+  (let [cbp (nth golomb-to-intra-cbp (eg/ue! r))]
     {:cbp-luma (mod cbp 16) :cbp-chroma (quot cbp 16)}))
 
 (defn- decode-chroma-dc!
@@ -756,16 +799,333 @@
                              {:addr addr :num-mb num-mb})))
           (recur next-addr (:qp state) dqp (conj states state)))))))
 
+;; --- Intra_4x4 (mb_type 0 = I_NxN with transform_size_8x8_flag 0) —
+;;     §7.3.5.1/§7.4.5 syntax, §8.3.1 decoding process. CAVLC only (see
+;;     `decode-intra-4x4-macroblock-body!`'s docstring for exactly what is
+;;     in and out of scope). ---
+
+(defn- i4x4-topright-available?
+  "§6.4.11.4 / Figure 6-10: is the 4x4 luma block ABOVE-RIGHT of block
+   index `b` (grid position [col row]) available as a prediction-sample
+   source at the moment block `b` is reconstructed?
+
+   The answer depends on THREE different things and collapsing any two of
+   them is the classic Intra_4x4 bug:
+   - `row` 0, `col` < 3 → the above-right samples come from the TOP
+     macroblock's bottom row, one 4x4 to the right: available iff a top
+     macroblock exists.
+   - `row` 0, `col` 3 → they come from the ABOVE-RIGHT macroblock
+     (mbAddrC), a fourth neighbour this repo's Intra_16x16 path never
+     needed: available iff that macroblock exists (`mb-y` > 0 AND `mb-x` <
+     mb-width-1 in raster-scan single-slice decode).
+   - `row` > 0 → they come from THIS macroblock, from the block at
+     [col+1, row-1] — available iff that block has ALREADY been
+     reconstructed, i.e. its block index is less than `b` in the Figure
+     6-10 Z-order decode order (`blk->col-row`). For `col` 3 the position
+     is past the macroblock's own right edge and the macroblock to the
+     right does not exist yet in raster order, so it is never available.
+
+   Working this out from the Z-order gives exactly the well-known
+   permanently-unavailable set #{3 7 11 13 15} for the `row` > 0 case,
+   which is a useful cross-check but NOT a substitute for the derivation:
+   the `row` == 0 cases are availability-dependent, not constant."
+  [b col row top-mb topright-mb]
+  (cond
+    (and (zero? row) (< col 3)) (some? top-mb)
+    (zero? row) (some? topright-mb)
+    (= col 3) false
+    :else (< (col-row->blk [(inc col) (dec row)]) b)))
+
+(defn- i4x4-neighbour-block
+  "The 13 §8.3.1.2 neighbouring luma samples for the 4x4 block at grid
+   position [col row] of the macroblock currently being reconstructed into
+   `recon` (a 16x16 row-major grid, positions belonging to not-yet-decoded
+   blocks still zero — never read, by construction of the availability
+   rules). Neighbour macroblock state maps carry `:top-row` (their bottom
+   16 luma pixels) and `:left-col` (their rightmost 16), the SAME keys the
+   Intra_16x16 path already produces, so nothing new is stored per
+   macroblock for this.
+
+   Returns the argument map `h264.intra-pred/predict-4x4` consumes; the
+   unavailable channels are nil so a mode that reads them fails loudly
+   instead of silently predicting from zeros."
+  [recon b col row left-mb top-mb topleft-mb topright-mb]
+  (let [x0 (* col 4) y0 (* row 4)
+        left-av? (or (pos? col) (some? left-mb))
+        top-av? (or (pos? row) (some? top-mb))
+        tl-av? (cond (and (pos? col) (pos? row)) true
+                     (pos? row) (some? left-mb)
+                     (pos? col) (some? top-mb)
+                     :else (some? topleft-mb))
+        tr-av? (i4x4-topright-available? b col row top-mb topright-mb)]
+    {:top-available? top-av?
+     :left-available? left-av?
+     :topleft-available? (boolean tl-av?)
+     :top-right-available? (boolean tr-av?)
+     :top (when top-av?
+            (if (pos? row)
+              (mapv #(get-in recon [(dec y0) (+ x0 %)]) (range 4))
+              (mapv #(nth (:top-row top-mb) (+ x0 %)) (range 4))))
+     :top-right (when tr-av?
+                  (cond
+                    (pos? row) (mapv #(get-in recon [(dec y0) (+ x0 4 %)]) (range 4))
+                    (< col 3) (mapv #(nth (:top-row top-mb) (+ x0 4 %)) (range 4))
+                    :else (mapv #(nth (:top-row topright-mb) %) (range 4))))
+     :left (when left-av?
+             (if (pos? col)
+               (mapv #(get-in recon [(+ y0 %) (dec x0)]) (range 4))
+               (mapv #(nth (:left-col left-mb) (+ y0 %)) (range 4))))
+     :topleft (when tl-av?
+                (cond (and (pos? col) (pos? row)) (get-in recon [(dec y0) (dec x0)])
+                      (pos? row) (nth (:left-col left-mb) (dec y0))
+                      (pos? col) (nth (:top-row top-mb) (dec x0))
+                      :else (get-in topleft-mb [:recon 15 15])))}))
+
+(defn- neighbour-i4x4-mode
+  "§8.3.1.1's `intraMxMPredModeN` for ONE neighbour (A = left 4x4 block, B =
+   above 4x4 block) of the block at grid position [col row].
+
+   The two ways this goes wrong, both of which produce a decodable-but-wrong
+   picture rather than a desync (the pred-mode syntax elements are
+   fixed-length, so a wrong DERIVED mode does not move the bit reader — it
+   only mis-predicts pixels, which is why this needs a real ffmpeg
+   comparison and not a round-trip test):
+   1. Returning the neighbour's stored mode when the neighbour macroblock
+      is NOT I_NxN. A macroblock coded Intra_16x16 (or inter) has no
+      Intra4x4PredMode at all and the spec substitutes DC (2). Storing
+      `nil` for those and letting `min` see it would be a different bug
+      again, so `:i4x4-modes` being absent is mapped to 2 explicitly here.
+   2. Applying `dcPredModePredictedFlag` per-neighbour. It is a SINGLE
+      flag: if EITHER neighbouring macroblock is unavailable, BOTH
+      intraMxMPredModeA and intraMxMPredModeB become 2 — not just the
+      missing one. `predIntra4x4PredMode` is `min` of the two, so getting
+      this wrong changes the result whenever the available neighbour's own
+      mode is below 2.
+
+   `constrained-intra-pred?` (PPS) additionally makes an INTER-coded
+   neighbour count as unavailable here. In this repo's scope I_NxN only
+   occurs in I-slices, where every macroblock is intra, so that clause is
+   currently unreachable; it is implemented rather than asserted-away
+   because it costs one `and` and its absence would be a silent wrong
+   answer the day I_NxN is wired into the P-slice path."
+  [own-modes col row left-mb top-mb constrained-intra-pred?]
+  (let [usable? (fn [mb] (and (some? mb)
+                              (not (and constrained-intra-pred? (:inter? mb)))))
+        a-mb-avail? (or (pos? col) (usable? left-mb))
+        b-mb-avail? (or (pos? row) (usable? top-mb))
+        dc-predicted? (or (not a-mb-avail?) (not b-mb-avail?))
+        mode-of (fn [mb blk]
+                  (if-let [modes (:i4x4-modes mb)] (nth modes blk) 2))]
+    (if dc-predicted?
+      2
+      (min (if (pos? col)
+             (nth own-modes (col-row->blk [(dec col) row]))
+             (mode-of left-mb (col-row->blk [3 row])))
+           (if (pos? row)
+             (nth own-modes (col-row->blk [col (dec row)]))
+             (mode-of top-mb (col-row->blk [col 3])))))))
+
+(defn- read-i4x4-pred-modes!
+  "Read the 16 `prev_intra4x4_pred_mode_flag` / `rem_intra4x4_pred_mode`
+   pairs of §7.3.5.1's `mb_pred()` and resolve each into a final
+   Intra4x4PredMode (§8.3.1.1's `Intra4x4PredMode[luma4x4BlkIdx]`).
+
+   These are read for ALL 16 blocks up front, in Figure 6-10 block order,
+   BEFORE `intra_chroma_pred_mode` and before `coded_block_pattern` — the
+   per-block reconstruction that consumes them happens much later
+   (`reconstruct-i4x4-luma`). Resolution cannot be deferred though: block
+   b's `predIntra4x4PredMode` depends on blocks b-1 and b-4's already
+   RESOLVED modes, so the fold has to carry them.
+
+   Returns a 16-element vector indexed by luma4x4BlkIdx."
+  [r left-mb top-mb constrained-intra-pred?]
+  (reduce
+   (fn [modes b]
+     (let [[col row] (blk->col-row b)
+           predicted (neighbour-i4x4-mode modes col row left-mb top-mb constrained-intra-pred?)
+           prev-flag (eg/bit! r)
+           mode (if (= 1 prev-flag)
+                  predicted
+                  (let [rem (eg/bits! r 3)]
+                    (if (< rem predicted) rem (inc rem))))]
+       (assoc modes b mode)))
+   (vec (repeat 16 2))
+   (range 16)))
+
+(defn- reconstruct-i4x4-luma
+  "§8.3.1's per-block reconstruction loop: for luma4x4BlkIdx 0..15 IN BLOCK
+   ORDER, predict the 4x4 block from the samples already reconstructed
+   (`i4x4-neighbour-block`), add its inverse-transformed residual, and
+   write it back before moving on.
+
+   This sequencing is the whole difference from `add-residual-16x16`, which
+   predicts the entire macroblock once and can therefore add its 16 residual
+   blocks in any order. Here block 1 predicts from block 0's RECONSTRUCTED
+   pixels, so the loop is genuinely sequential and cannot be reordered or
+   parallelised across the 16 blocks."
+  [modes block-coeffs left-mb top-mb topleft-mb topright-mb]
+  (reduce
+   (fn [recon b]
+     (let [[col row] (blk->col-row b)
+           nb (i4x4-neighbour-block recon b col row left-mb top-mb topleft-mb topright-mb)
+           pred (intra-pred/predict-4x4 (nth modes b) nb)
+           residual (transform/inverse-4x4 (nth block-coeffs b))]
+       (reduce
+        (fn [recon ry]
+          (reduce
+           (fn [recon rx]
+             (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)]
+                       (clip8 (+ (get-in pred [ry rx]) (get-in residual [ry rx])))))
+           recon (range 4)))
+        recon (range 4))))
+   (vec (repeat 16 (vec (repeat 16 0))))
+   (range 16)))
+
+(defn- reject-intra-8x8!
+  "Refuse an I_NxN macroblock that MIGHT be Intra_8x8 (§8.3.2) rather than
+   Intra_4x4 (§8.3.1).
+
+   The two share one mb_type (0, I_NxN) and are told apart by
+   `transform_size_8x8_flag`, present in `macroblock_layer()` only when the
+   PPS carries `transform_8x8_mode_flag`. That PPS field sits after
+   `more_rbsp_data()` and `h264.pps` documents itself as not parsing it, so
+   for a stream where it COULD be set this decoder cannot see which of the
+   two an I_NxN macroblock is. It only exists in the High-Profile family, so
+   the refusal is keyed on the SPS `profile_idc`: Baseline/Main streams
+   cannot carry the flag at all and their I_NxN unambiguously means
+   Intra_4x4.
+
+   Intra_8x8 is deliberately not half-implemented — it needs the 8x8 integer
+   transform and the §8.3.2.2 reference-sample low-pass filter, neither of
+   which exists in this repo — so this is a refusal with a pinned reason,
+   not a fallback to the 4x4 modes (which would decode an Intra_8x8
+   macroblock into plausible-looking garbage)."
+  [profile-idc]
+  (when (contains? sps/high-profile-family profile-idc)
+    (throw (ex-info "h264.decode: I_NxN in a High-Profile-family stream is not supported (transform_size_8x8_flag / Intra_8x8 cannot be ruled out)"
+                    {:profile-idc profile-idc
+                     :reason "Intra_8x8 (transform_size_8x8_flag) not implemented"}))))
+
+(defn- decode-intra-4x4-macroblock-body!
+  "Decode one I_NxN / Intra_4x4 macroblock (mb_type 0 in an I-slice) from
+   CAVLC reader `r`, given an already-read mb_type.
+
+   ## In scope
+   All nine §8.3.1.2 Intra_4x4 luma prediction modes, the §8.3.1.1
+   neighbour-derived `predIntra4x4PredMode`, the §7.3.5.1
+   `prev_intra4x4_pred_mode_flag`/`rem_intra4x4_pred_mode` syntax, Table
+   9-4's INTRA `coded_block_pattern` mapping, and 16 full 4x4 residual
+   blocks (`decode-regular-block!`, maxNumCoeff 16 — I_NxN has NO
+   macroblock-level luma DC/Hadamard block, exactly like an inter
+   macroblock and unlike Intra_16x16). Chroma is UNCHANGED — I_NxN affects
+   the luma prediction structure only, so `decode-chroma-dc!`/
+   `decode-chroma-ac-blocks!`/`reconstruct-chroma-plane` are reused
+   verbatim.
+
+   ## Out of scope, and rejected rather than approximated
+   - **Intra_8x8 (§8.3.2)** — the OTHER thing mb_type 0 can mean. It needs
+     the 8x8 integer transform and the §8.3.2.2 reference-sample low-pass
+     filter, i.e. a genuinely separate feature, not a variation on this
+     one. It is signalled by `transform_size_8x8_flag`, which is only
+     present when the PPS carries `transform_8x8_mode_flag` — a High
+     Profile field that `h264.pps` documents itself as not parsing (it sits
+     after `more_rbsp_data()`). This function therefore rejects I_NxN
+     up-front for any High-Profile-family stream, where that flag COULD be
+     set and we cannot see it, rather than assuming Intra_4x4 and
+     mis-decoding an Intra_8x8 macroblock into plausible garbage. For a
+     Baseline/Main stream the flag cannot be present at all and I_NxN
+     unambiguously means Intra_4x4.
+   - **CABAC-coded I_NxN** — `mb_type`, the pred-mode flags and
+     `coded_block_pattern` all have their own CABAC context models
+     (§9.3.3.1.1.x) that `h264.cabac` does not implement; the CABAC I-slice
+     path still rejects mb_type 0 via `i16x16-mb-info`. Stated follow-up,
+     not a silent gap.
+
+   `topright-mb` is the ABOVE-RIGHT neighbour macroblock state — a fourth
+   neighbour the Intra_16x16 path never needed (see
+   `i4x4-topright-available?`).
+
+   Returns the same state shape `decode-intra-macroblock-body!` returns,
+   plus `:i4x4-modes` (16-element vector of Intra4x4PredMode, consumed by
+   the NEXT macroblock's `neighbour-i4x4-mode`) and `:pred-mode` nil (an
+   I_NxN macroblock has no Intra_16x16 prediction mode — nil rather than a
+   plausible 2, so `:mb-pred-modes` cannot be misread as 'DC everywhere')."
+  [r qp chroma-qp-index-offset profile-idc constrained-intra-pred?
+   left-mb top-mb topleft-mb topright-mb]
+  (reject-intra-8x8! profile-idc)
+  (let [modes (read-i4x4-pred-modes! r left-mb top-mb constrained-intra-pred?)
+        intra-chroma-pred-mode (eg/ue! r)
+        {:keys [cbp-luma cbp-chroma]} (read-coded-block-pattern-intra! r)
+        ;; §7.3.5: for I_NxN, mb_qp_delta and residual() are present ONLY
+        ;; when the cbp is non-zero (unlike Intra_16x16, whose mb_qp_delta
+        ;; is unconditional because it always carries a luma DC block).
+        any-residual? (or (pos? cbp-luma) (pos? cbp-chroma))
+        mb-qp-delta (if any-residual? (eg/se! r) 0)
+        qp' (mod (+ qp mb-qp-delta 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        ac-nnz (atom (vec (repeat 16 0)))
+        block-coeffs
+        (mapv
+         (fn [b]
+           (let [[col row] (blk->col-row b)]
+             (if-not (bit-test cbp-luma (quot b 4))
+               (vec (repeat 16 0))
+               (let [nA (if (pos? col)
+                          (nth @ac-nnz (col-row->blk [(dec col) row]))
+                          (when left-mb (nth (:ac-nnz left-mb) (col-row->blk [3 row]))))
+                     nB (if (pos? row)
+                          (nth @ac-nnz (col-row->blk [col (dec row)]))
+                          (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [col 3]))))
+                     nc (neighbor-nc nA nB)
+                     {:keys [raster total-coeff]} (decode-regular-block! r nc qp')]
+                 (swap! ac-nnz assoc b total-coeff)
+                 raster))))
+         (range 16))
+        recon (reconstruct-i4x4-luma modes block-coeffs left-mb top-mb topleft-mb topright-mb)
+        cb-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        cr-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-corner (get-in topleft-mb [:cb :recon 7 7])
+        cr-corner (get-in topleft-mb [:cr :recon 7 7])
+        cb-recon (reconstruct-chroma-plane cb-block-coeffs intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr-recon (reconstruct-chroma-plane cr-block-coeffs intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)]
+    {:recon recon
+     :qp qp'
+     :pred-mode nil
+     :i4x4? true
+     :i4x4-modes modes
+     :intra-chroma-pred-mode intra-chroma-pred-mode
+     :dc-nnz 0
+     :ac-nnz @ac-nnz
+     :inter? false
+     :mv nil
+     :top-row (nth recon 15)
+     :left-col (mapv #(nth % 15) recon)
+     :cb (assoc cb-recon :ac-nnz cb-ac-nnz)
+     :cr (assoc cr-recon :ac-nnz cr-ac-nnz)}))
+
 (defn- decode-macroblock!
-  "I-slice entry point: read `mb_type` directly (I-slice numbering, 1..24
-   for Intra16x16 — see `i16x16-mb-info`), then delegate to
-   `decode-intra-macroblock-body!`. Kept as a separate fn (rather than
-   inlining the `eg/ue! r` read into every caller) purely so the I-slice
-   macroblock loop's call shape stays unchanged from before the P-slice
-   addition."
-  [r qp chroma-qp-index-offset left-mb top-mb topleft-mb]
+  "I-slice entry point: read `mb_type` directly (I-slice numbering per Table
+   7-11 — 0 = I_NxN, 1..24 = Intra_16x16, 25 = I_PCM) and dispatch on it.
+
+   mb_type 0 (I_NxN) is the Intra_4x4 path (`decode-intra-4x4-macroblock-body!`);
+   1..24 keep the Intra_16x16 path unchanged. 25 (I_PCM) still throws, via
+   `i16x16-mb-info`. The two paths differ in almost every syntax element
+   after mb_type — pred modes, `coded_block_pattern`'s me(v) table, whether
+   `mb_qp_delta` is unconditional, and whether there is a macroblock-level
+   luma DC block at all — so the dispatch is here rather than inside a
+   shared body."
+  [r qp chroma-qp-index-offset profile-idc constrained-intra-pred?
+   left-mb top-mb topleft-mb topright-mb]
   (let [mb-type (eg/ue! r)]
-    (decode-intra-macroblock-body! r mb-type qp chroma-qp-index-offset left-mb top-mb topleft-mb)))
+    (if (zero? mb-type)
+      (decode-intra-4x4-macroblock-body! r qp chroma-qp-index-offset profile-idc
+                                          constrained-intra-pred?
+                                          left-mb top-mb topleft-mb topright-mb)
+      (decode-intra-macroblock-body! r mb-type qp chroma-qp-index-offset left-mb top-mb topleft-mb))))
 
 ;; --- P-slice inter prediction (ADR-2607122000 Migration step 7:
 ;;     P_Skip + P_L0_16x16, with real sub-pel/non-zero motion compensation
@@ -1565,7 +1925,17 @@
                          left-mb (when (pos? mb-x) (nth states (dec addr)))
                          top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
                          topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
-                         state (decode-macroblock! r qp chroma-qp-index-offset left-mb top-mb topleft-mb)]
+                         ;; mbAddrC (above-right) — needed ONLY by Intra_4x4,
+                         ;; whose blocks at grid row 0 / col 3 read p[4..7,-1]
+                         ;; out of this macroblock (see
+                         ;; `i4x4-topright-available?`). The Intra_16x16 path
+                         ;; never referenced it.
+                         topright-mb (when (and (pos? mb-y) (< mb-x (dec mb-width)))
+                                       (nth states (- addr mb-width -1)))
+                         state (decode-macroblock! r qp chroma-qp-index-offset
+                                                   (:profile-idc sps-map)
+                                                   (:constrained-intra-pred? pps-map)
+                                                   left-mb top-mb topleft-mb topright-mb)]
                      (recur (inc addr) (:qp state) (conj states state)))))
             :p (decode-p-slice-mbs! r (:slice-qp header) chroma-qp-index-offset mb-width mb-height ref-frame)))
         w (:width sps-map) h (:height sps-map)
@@ -1602,6 +1972,18 @@
      ;; below for those.
      :mb-pred-modes (mapv :pred-mode mb-states)
      :mb-intra-chroma-pred-modes (mapv :intra-chroma-pred-mode mb-states)
+     ;; per-MB I_NxN (Intra_4x4) flag and, for those macroblocks, the 16
+     ;; resolved Intra4x4PredModes in luma4x4BlkIdx order (nil for every
+     ;; other mb_type). Exposed for the SAME reason `:mb-pred-modes` is:
+     ;; so a test can assert WHICH macroblock types and prediction modes a
+     ;; real encoder actually emitted, BEFORE comparing pixels — a fixture
+     ;; that silently encoded as all-Intra_16x16 would otherwise let a
+     ;; pixel-comparison test pass without executing the Intra_4x4 path at
+     ;; all. Note `:mb-pred-modes` is nil at exactly the positions
+     ;; `:mb-i4x4?` is true (an I_NxN macroblock has no Intra_16x16
+     ;; prediction mode).
+     :mb-i4x4? (mapv #(boolean (:i4x4? %)) mb-states)
+     :mb-i4x4-modes (mapv :i4x4-modes mb-states)
      ;; per-MB inter/intra flag + final motion vector (nil for intra MBs) —
      ;; new as of the P-slice addition; always all-false/all-nil for an
      ;; I-slice picture.

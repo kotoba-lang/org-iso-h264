@@ -12,7 +12,15 @@
    media/graphics standards-substrate split (com-junkawasaki/root)."
   (:require [h264.expgolomb :as eg]))
 
-(def ^:private high-profile-family
+(def high-profile-family
+  "profile_idc values whose SPS carries the High-Profile-family extension
+   fields (chroma_format_idc, bit_depth_*, scaling lists) AND whose PPS may
+   carry the trailing `transform_8x8_mode_flag`. Public because
+   `h264.decode` needs the second half of that: `transform_8x8_mode_flag`
+   is what decides whether an I_NxN macroblock means Intra_4x4 or
+   Intra_8x8, and `h264.pps` documents itself as not parsing it, so
+   Intra_4x4 decode has to refuse a stream where the flag COULD be present
+   rather than assume it is absent."
   #{100 110 122 244 44 83 86 118 128 138 139 134 135})
 
 (defn- skip-scaling-list! [r size]
