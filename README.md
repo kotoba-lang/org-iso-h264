@@ -68,6 +68,8 @@ below for exactly what is/isn't covered).
 | `h264.sps` | decode: SPS (NAL type 7) parse: profile/level + picture width/height (handles high-profile chroma/scaling-list fields correctly so the bit position stays aligned, though scaling-list *values* aren't surfaced). encode: `encode`, non-high-profile only, no frame-cropping (width/height must be multiples of 16) — see Encoding below |
 | `h264.pps` | decode: PPS (NAL type 8) parse: entropy coding mode (CAVLC/CABAC), reference index defaults, QP/deblocking/intra-pred flags. Covers the common case (`num_slice_groups_minus1 == 0` — FMO is essentially absent from real-world encoders); throws rather than silently mis-parsing if FMO is present. High-Profile-only trailing fields (`transform_8x8_mode_flag` etc., gated by `more_rbsp_data()`) aren't parsed — this reader doesn't track exact bit position precisely enough to detect that condition. encode: `encode`, covers the same field set as `parse` |
 | `h264.slice` | decode: slice header parse (`first_mb_in_slice`/`slice_type`/`pic_parameter_set_id`/`frame_num`/`idr_pic_id`/POC (type 0 or 2 only)/IDR dec_ref_pic_marking flags/`slice_qp_delta`/deblocking-control fields, read-and-discarded). `parse-header!` advances the SAME reader `h264.decode` continues using for macroblock data (unlike `sps`/`pps`'s private-reader `parse`). ALSO: P-slice fields (`num_ref_idx_active_override_flag`/`num_ref_idx_l0_active_minus1` — must resolve to exactly 1 active reference — `ref_pic_list_modification_flag_l0`/weighted-prediction/non-IDR `dec_ref_pic_marking` — all throw if set to anything beyond this repo's single-reference-frame, no-reordering, no-weighting scope), see "Pixel decode: P-slice (inter)" below. encode: `encode-header!` (I-slice) AND `encode-p-header!` (P-slice, new — see "Pixel encode: P-slice (inter)" below) |
+| `h264.syntax` | **not a parser — a reader for parsers.** Generic interpreter for ISO/IEC 14496-10 §7.3-style *syntax tables* expressed as EDN data: rows of `[:u n name]` / `[:ue name]` / `[:se name]` / `[:f n name]` plus `[:when cond rows]` / `[:for count rows]` / `[:infer name v]` / `[:escape key & args]`, over a closed expression grammar (`[:var k]`, `[:at k i]`, `[:idx]`, comparisons, arithmetic). Reads §7.3 only; §7.4 semantics stay code, exactly as the standard splits them. `ae(v)` is refused, not faked — see "Table-driven syntax" below |
+| `h264.sps-table` | the table-driven counterpart of `h264.sps/parse`, built to be COMPARED with it rather than to replace it: `resources/h264/syntax/sps.edn` (§7.3.2.1.1 as data) + `h264.syntax` + a 12-line §7.4.2.1.1 `semantics` fn + an 8-line `scaling-list-escape`. `h264.sps` remains the shipping parser |
 | `h264.quant` | dequantization: the `normAdjust4x4` V-table (§8.5.9) + per-position `ac-qmul`/single-scalar `dc-qmul`. Implements `codec-primitives.quant/QuantScale`. Baseline scope only — no custom scaling lists (flat weight 16 everywhere) |
 | `h264.transform` | decode: the integer 4x4 inverse transform (`inverse-4x4`, §8.5.10) + the Intra16x16 luma DC Hadamard transform (`luma-dc-hadamard`) + the chroma-DC 2x2 Hadamard transform (`chroma-dc-hadamard`). Arithmetic ported 1:1 from FFmpeg's reference decoder for bit-exactness, including an internal coefficient-array transpose whose necessity was discovered empirically (see "Pixel decode" below). encode: `forward-4x4` (textbook forward transform, API symmetry/DC-extraction only) + `forward-luma-dc-hadamard` (exact derived inverse of `luma-dc-hadamard`) + `forward-chroma-dc-hadamard` (exact derived inverse of `chroma-dc-hadamard`, same probe-and-invert methodology) — see "Pixel encode" below |
 | `h264.cavlc` | decode: CAVLC residual entropy decode (§9.2): `coeff_token`/`total_zeros`/`run_before` VLC tables (luma AND the ChromaArrayType 1 chroma-DC `nC==-1` special case) + `residual-block!` (coeff_token → trailing-ones signs → level_prefix/suffix → total_zeros → run_before → position reconstruction). encode: `encode-residual-block!`, reusing the same tables as reverse lookups (already generic over `:chroma-dc` — no chroma-specific CAVLC encode code was needed; also reused UNCHANGED for P_L0_16x16's full 16-coefficient regular luma blocks, see "Pixel encode: P-slice (inter)") |
@@ -1234,8 +1236,122 @@ against the real, already-tested `parse-header!` (both `nal_ref_idc`=0 and
 nonzero cases, and the deblocking-field-absent case), the same discipline
 `encode-header-roundtrips` already used for the I-slice header.
 
+## Table-driven syntax (`h264.syntax`, ADR-2608290100)
+
+ISO/IEC 14496-10 §7.3 prints H.264's bitstream syntax as a **table**: rows of
+(element name, descriptor, presence condition), where the descriptors are
+`u(n)`, `ue(v)`, `se(v)`, `f(n)`, `ae(v)`. `h264.syntax` tests whether that
+table can be *data* — one generic reader interpreting an EDN transcription, so
+that a new bitstream structure costs one EDN file instead of one hand-written
+parser.
+
+`resources/h264/syntax/sps.edn` is §7.3.2.1.1 `seq_parameter_set_data( )`
+transcribed as 29 descriptor rows. The seven `constraint_setN_flag` /
+`reserved_zero_2bits` rows are written the way the standard writes them rather
+than as the incumbent's single `u(8)` shortcut — and consume the same eight
+bits.
+
+**Nothing here replaces anything.** `h264.sps`, `h264.pps` and `h264.slice`
+are unchanged and remain the shipping parsers; they pass real golden-vector
+tests against ffmpeg output. `h264.sps-table` exists so the design can be
+judged on evidence, and `test/h264/syntax_equivalence_test.clj` is that
+evidence: it asserts the table-driven parse equals `h264.sps/parse`, whole map,
+on 27 SPS NALs across every fixture in the repo, on 90 SPSs spanning
+everything `h264.sps/encode` can produce, and on synthetic streams written
+bit-by-bit that reach paths the incumbent's own tests never do — high-profile
+scaling lists (both the run-to-completion and the `nextScale`-reaches-zero
+early-exit branch), `chroma_format_idc` 3 with twelve lists,
+`pic_order_cnt_type` 1 with its `num_ref_frames_in_pic_order_cnt_cycle` loop,
+interlaced `mb_adaptive_frame_field_flag`, and cropping in every direction.
+For the synthetic cases the test also pins that the reader stopped at *exactly*
+the bit the writer stopped at.
+
+### How much of a hand-written parser is actually a table?
+
+Measured line by line across `h264.sps/parse`, `h264.sps/skip-scaling-list!`,
+`h264.pps/parse` and `h264.slice/parse-header!`
+(`docs/measurement/syntax-table-compression.edn` carries the per-line
+assignment so the ratio is re-checkable):
+
+| | lines | share |
+|---|---|---|
+| direct §7.3 syntax-table transcription | 79 | 52.0% |
+| reader scaffolding the generic reader subsumes | 16 | 10.5% |
+| genuine logic | 57 | 37.5% |
+
+and the 57 lines of genuine logic divide as **31 output-map / API renaming**,
+**15 deliberate scope refusals** (`throw` on MMCO, weighted prediction, FMO,
+reference-list reordering) and only **11 §7.4 derivations** — SubWidthC /
+CropUnitX / width / height, the Table 7-6 `slice_type` mod-5 collapse, and
+`scaling_list( )`'s `lastScale`/`nextScale` state machine.
+
+The qualification matters as much as the ratio: these three namespaces are 490
+of `src/h264`'s 6,454 lines. The other 5,964 are §8 reconstruction and §9
+entropy coding — `decode.cljc` has 14 raw Exp-Golomb read sites in 1,683 lines
+against 28 CABAC call sites. Within one codec the compression is real but
+narrow; its value is across codecs, because the header parser is the part every
+new codec must write from scratch.
+
+### What the format cannot express
+
+Stated as limits, not as future work, and **enforced** rather than merely
+documented (each has a test):
+
+- **`ae(v)`.** An arithmetic-coded element's bit cost depends on adaptive
+  context state that depends on every previously decoded element. No
+  (name, descriptor, condition) triple determines it. `[:unsupported :ae]` is
+  the only honest row, and reaching it throws.
+- **Spec sub-structures whose body contains assignments rather than descriptor
+  rows.** §7.3.2.1.1.1 `scaling_list( )` is the canonical case — the loop's
+  continuation depends on a running value the loop computes. Those take
+  `[:escape]`, and `h264.sps-table/scaling-list-escape` is eight lines of
+  ordinary code, labelled as such.
+- **§7.4 derivations** beyond a plain inferred constant.
+- **`more_rbsp_data()`-gated tails**, which need the RBSP's exact trailing-bit
+  position.
+- **Byte-offset arithmetic, little-endian fields, and length-prefixed recursive
+  containers** — which is why this format reaches AV1's `sequence_header` /
+  `frame_header` but not ISOBMFF's or RIFF's box trees.
+
+A `[:var]` on an element that has not been read **throws** rather than seeing
+`nil`, and a presence condition that does not evaluate to a strict boolean is
+**rejected** rather than silently taking the `0` branch as true — H.264 flags
+are `0`/`1` ints, so `[:= [:var :some_flag] 1]` is required.
+
+Full design, the measurement, the three deliberate breakages that show the
+equivalence test fails for the reason it names, and the reach estimate across
+this ecosystem's other spec repos: `docs/adr/2608290100-table-driven-bitstream-syntax.edn`.
+
 ## Test
 
 ```sh
 clojure -M:test
 ```
+
+## The guest-grammar reader does not pass `amu check` yet
+
+`src/h264/syntax.kotoba` is the table-driven reader written in Kotoba guest
+grammar, which is where it has to live for the design to reach a backend at
+all — a reader written in full Clojure lands on the JVM permanently. It does
+not yet clear the compiler's front door:
+
+```
+bin/amu check src/h264/syntax.kotoba   exit 65
+  :kotoba.error/namespace-export-clause  line 2
+  "only a bounded :export vector is admitted in a guest namespace"
+
+bin/amu check src/h264/sps.kotoba      exit 65   same error
+bin/amu check src/h264/expgolomb.kotoba exit 0   admitted, effects #{}
+bin/amu check src/h264/rbsp.kotoba      exit 0   admitted, effects #{}
+```
+
+Measured 2026-08-30 against amu at `kotoba-lang/amu` tip. So of this repo's
+four `.kotoba` namespaces, the two single-file ones are admitted and the two
+carrying a `:require` are not. That is a front-door gap, not evidence about
+the table design — but it does mean the `.cljc` reader is the only one that
+runs today, and the `.kotoba` one is an unexecuted transcription until the
+clause is admitted.
+
+The equivalence test compares the `.cljc` reader against the hand-written
+`h264.sps` parser, so the evidence for the design is real; the evidence that
+this design reaches a backend is not yet.
