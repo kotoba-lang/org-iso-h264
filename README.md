@@ -189,9 +189,11 @@ golden model for a future capability-gated *native* realtime decoder
 - Baseline profile, CAVLC (no CABAC)
 - A single IDR I-slice covering the whole picture (no multi-slice, no
   multiple pictures/GOP, no P/B slices, no reference-picture buffering)
-- `mb_type` **Intra_16x16 only** (1..24) — `I_NxN`/Intra_4x4/Intra_8x8
-  (`mb_type` 0) and `I_PCM` (`mb_type` 25) throw a clear error rather than
-  being silently mis-decoded
+- `mb_type` **Intra_16x16 (1..24) AND `I_NxN`/Intra_4x4 (0)** — Intra_4x4 is
+  new, see "Pixel decode: Intra_4x4 (I_NxN)" below for its own scope
+  section. **Intra_8x8** — the other thing `mb_type` 0 can mean, told apart
+  by `transform_size_8x8_flag` — and `I_PCM` (`mb_type` 25) still throw a
+  clear error rather than being silently mis-decoded
 - Both `CodedBlockPatternLuma` values I16x16 macroblocks can have: 0 (DC-
   only, no AC residual) and 15 (full AC residual for all four luma 8x8
   groups) — both real CAVLC paths are exercised
@@ -222,7 +224,9 @@ golden model for a future capability-gated *native* realtime decoder
 **What's explicitly NOT implemented** (out of scope, not silently wrong):
 P/B slices and all inter prediction/motion compensation, multiple
 reference frames, ChromaArrayType 0/2/3 (monochrome/4:2:2/4:4:4), the
-deblocking loop filter, `I_NxN`/`I_PCM` macroblock types, Plane *luma*
+deblocking loop filter, **Intra_8x8** (§8.3.2 — needs the 8x8 integer
+transform and the §8.3.2.2 reference-sample low-pass filter; deliberately
+not half-implemented, see below) and `I_PCM` macroblock types, Plane *luma*
 intra prediction (Plane *chroma* IS implemented, see above), frame
 cropping (picture width/height must be exact multiples of 16), and
 multi-picture streams (only the first IDR slice is decoded). CABAC
@@ -375,6 +379,150 @@ i.e. right-shaped, wrong-valued) output:**
   order at all, so this only surfaces with real multi-component AC
   content. See `h264.decode/decode-chroma-ac-blocks!`'s docstring.
 
+## Pixel decode: Intra_4x4 (`I_NxN`)
+
+This is the increment that makes the decoder able to decode content, rather
+than content constructed to be decodable.
+
+**Why it was the blocking gap.** Every fixture in this repo before this
+increment is flat, or varies along exactly one axis, and that is not an
+accident of taste. **libx264 cannot be told to avoid Intra_4x4:**
+`--partitions none` still leaves `analyse=0x1:0` in its own encode log, and
+that `0x1` is `X264_ANALYSE_I4x4`. Only content with no texture gives the
+encoder no RD reason to pick `I_NxN` for any macroblock. So the earlier
+fixtures were flat *in order to be decodable at all* — the decoder could
+pass its whole suite while rejecting anything a real encoder emits from a
+real picture, with `only Intra_16x16 mb_type (1..24) is supported`.
+
+**What is implemented.**
+
+- **`mb_type` 0 (`I_NxN`)** in a CAVLC I-slice, dispatched in
+  `decode-macroblock!` to `decode-intra-4x4-macroblock-body!`. The two
+  paths diverge in almost every syntax element after `mb_type`, so the
+  dispatch is at the top rather than inside a shared body.
+- **All nine §8.3.1.2 prediction modes** (`h264.intra-pred/predict-4x4`):
+  Vertical, Horizontal, DC, Diagonal_Down_Left, Diagonal_Down_Right,
+  Vertical_Right, Horizontal_Down, Vertical_Left, Horizontal_Up. Note
+  Table 8-2's mode numbering is a THIRD numbering, distinct from both
+  Intra_16x16's and Table 8-5's chroma one; only Horizontal (1) and DC (2)
+  coincide across all three.
+- **The §8.3.1.1 predicted-mode derivation** (`neighbour-i4x4-mode`) —
+  `predIntra4x4PredMode = min(intraMxMPredModeA, intraMxMPredModeB)` over
+  the left and above 4x4 blocks, with `dcPredModePredictedFlag` as a
+  SINGLE flag (if either neighbouring macroblock is unavailable, BOTH
+  become DC — not just the missing one) and with a neighbour that is not
+  itself `I_NxN` contributing DC. This is where the real difficulty is: it
+  is stateful across macroblock boundaries (each `I_NxN` macroblock stores
+  its 16 resolved modes as `:i4x4-modes` for its right/below neighbours),
+  and getting it wrong does NOT desync the bit reader — the pred-mode
+  syntax elements are fixed-length, so a wrong derived mode only
+  mis-predicts pixels. That is why this needs a real ffmpeg pixel
+  comparison and cannot be caught by a round-trip test.
+- **§7.3.5.1 `mb_pred` syntax**: 16 `prev_intra4x4_pred_mode_flag` u(1) /
+  `rem_intra4x4_pred_mode` u(3) pairs, read up front in Figure 6-10 block
+  order before `intra_chroma_pred_mode`, but RESOLVED as they are read
+  (block b's predictor depends on blocks b-1 and b-4's resolved modes).
+- **Table 9-4's Intra `coded_block_pattern` column** (`golomb-to-intra-cbp`)
+  — a different permutation from the inter column already present.
+- **`mb_qp_delta` conditional on a non-zero cbp**, unlike Intra_16x16 where
+  it is unconditional because that mb_type always carries a luma DC block.
+- **16 full 4x4 residual blocks** (`decode-regular-block!`, maxNumCoeff 16).
+  `I_NxN` has NO macroblock-level luma DC/Hadamard block — the same residual
+  shape as an inter macroblock, not Intra_16x16's DC/AC split.
+- **The above-right neighbour macroblock (mbAddrC)**, a fourth neighbour the
+  Intra_16x16 path never needed: blocks at grid row 0 / col 3 read
+  `p[4..7,-1]` out of the macroblock entirely.
+- **§8.3.1.2's `p[4..7,-1]` substitution**: when the above-right samples are
+  unavailable but `p[3,-1]` is available, `p[4..7,-1]` are replicated from
+  `p[3,-1]`. Not optional — Diagonal_Down_Left and Vertical_Left read those
+  samples unconditionally, and five of the sixteen 4x4 positions per
+  macroblock (`#{3 7 11 13 15}`) always have an unavailable above-right.
+- **The per-block sequential reconstruction loop** (`reconstruct-i4x4-luma`):
+  block 1 predicts from block 0's RECONSTRUCTED pixels, so unlike
+  `add-residual-16x16` the 16 blocks cannot be reordered.
+
+Chroma is unchanged — `I_NxN` changes the luma prediction structure only, so
+`decode-chroma-dc!`/`decode-chroma-ac-blocks!`/`reconstruct-chroma-plane`
+are reused verbatim.
+
+**What is still out of scope, and refused rather than approximated.**
+
+- **Intra_8x8 (§8.3.2)** — the OTHER thing `mb_type` 0 can mean. It needs
+  the 8x8 integer transform and the §8.3.2.2 reference-sample low-pass
+  filter, i.e. a separate feature rather than a variation on this one, so
+  it is deliberately not half-implemented. It is signalled by
+  `transform_size_8x8_flag`, present only when the PPS carries
+  `transform_8x8_mode_flag` — a High Profile field `h264.pps` documents
+  itself as not parsing (it sits after `more_rbsp_data()`). `reject-intra-8x8!`
+  therefore refuses `I_NxN` up front for any High-Profile-family
+  `profile_idc`, where the flag COULD be set and cannot be seen, rather
+  than assuming Intra_4x4 and decoding an Intra_8x8 macroblock into
+  plausible garbage. For a Baseline/Main stream the flag cannot be present
+  at all and `I_NxN` unambiguously means Intra_4x4.
+- **CABAC-coded `I_NxN`** — `mb_type`, the pred-mode flags and
+  `coded_block_pattern` all have their own §9.3.3.1.1.x context models that
+  `h264.cabac` does not implement. The CABAC I-slice path still refuses
+  `mb_type` 0. Stated follow-up, not a silent gap.
+- **`I_NxN` inside a P-slice** (Table 7-13's `p_mb_type - 5` == 0) — the
+  P-slice path delegates intra macroblocks to the Intra_16x16 body, which
+  refuses `mb_type` 0. Also a stated follow-up.
+
+Both refusals go through a pinned reason literal asserted in
+`decode_test.clj`'s `unsupported-mb-type-throws`, which also asserts the
+Intra_8x8 refusal does NOT fire for a Baseline `profile_idc` — i.e. that
+the check refuses for the reason it names, rather than always.
+
+**Validation** (`i4x4-mandel64-golden-vector` in `test/h264/decode_test.clj`).
+
+```
+ffmpeg -f lavfi -i "mandelbrot=size=64x64:rate=1" -frames:v 1 \
+  -pix_fmt yuv420p src64.y4m
+x264 --input-res 64x64 --fps 25 -o i4x4-mandel64.h264 --qp 26 \
+  --keyint 1 --no-deblock --partitions i4x4 --profile baseline src64.y4m
+ffmpeg -i i4x4-mandel64.h264 -pix_fmt yuv420p i4x4-mandel64.ref.yuv
+```
+
+A Mandelbrot render — texture at every scale, the opposite of every earlier
+fixture. x264's own encode log for this file reports
+`mb I  I16..4:  6.2%  0.0% 93.8%` (15 of 16 macroblocks `I_NxN`) and
+`i4 v,h,dc,ddl,ddr,vr,hd,vl,hu:  3% 15% 20% 15% 12%  7% 13%  5%  9%` — a
+non-zero share for **every one of the nine modes**. `--no-deblock` for the
+same reason as `horizontal-multimb64.h264`: real texture produces real
+block-boundary discontinuities and this repo has no deblocking filter.
+Luma and both chroma planes are bit-exact against ffmpeg 8.1.1's own
+reconstruction, no tolerance.
+
+**The pixel comparison is gated on a structural assertion that runs first.**
+A fixture that quietly re-encoded as all-Intra_16x16 would let the pixel
+comparison pass without executing a line of this code, so
+`assert-i4x4-coverage!` refuses to compare pixels unless three things hold:
+every macroblock is the type **ffmpeg itself** reported
+(`ffmpeg -v debug -debug mb_type`, whose dump for this file is
+`I i i i / i i i i / i i i i / i i i i` — ground truth from outside this
+repo, not from the decoder under test); `:mb-pred-modes` is nil at exactly
+the positions `:mb-i4x4?` is true, so a state map that forgot to set the
+flag cannot pass; and all nine prediction modes actually occur, which x264's
+own log independently confirms is a property of the bitstream.
+
+**The test was shown to discriminate.** With `neighbour-i4x4-mode`'s single
+`dcPredModePredictedFlag` changed to the plausible-looking per-neighbour
+form — substituting DC only for the neighbour whose macroblock is
+unavailable, instead of for both — the fixture still decodes end to end
+with no desync and no exception (as expected: the pred-mode syntax elements
+are fixed-length, so a wrong derived mode moves no bits), the macroblock
+types still match ffmpeg's dump, and all nine prediction modes still appear
+— so the structural assertion passes unchanged. **38 of the 4,096 luma
+bytes come out wrong**, first at row 0 column 52, and the luma assertion
+fails. Both chroma planes stay bit-exact, as they should: this bug is in
+luma prediction only.
+
+38 bytes is a small signal, and that is the point rather than a weakness of
+the check. Nothing short of a bit-exact comparison against a real decoder's
+own reconstruction would see it: the picture still decodes, still has the
+right structure, still looks like a Mandelbrot set. A tolerance, a
+checksum-of-a-downsample, or a round-trip through this repo's own encoder
+would all report success.
+
 ## Pixel decode: CABAC (Wave 8, ADR-2607122000 CABAC increment)
 
 `h264.cabac`, wired into `h264.decode`, adds real CABAC (Context-Adaptive
@@ -433,8 +581,11 @@ tier as every other decode path here.
   Intra_16x16 macroblocks specifically — it's used for INTER macroblocks
   instead, see "Pixel decode: CABAC + P-slice (inter)" below
   (`read-coded-block-pattern-inter-cabac!`); `I_NxN`'s own use of this same
-  context model remains out of scope (this repo never decodes `I_NxN`,
-  CABAC or CAVLC alike).
+  context model remains out of scope. `I_NxN` IS decoded now, but only on
+  the **CAVLC** path (see "Pixel decode: Intra_4x4 (I_NxN)" below) — CABAC
+  `I_NxN` needs its own `mb_type` binarization branch plus the
+  `prev_intra4x4_pred_mode_flag`/`rem_intra4x4_pred_mode` context models,
+  none of which exist, so the CABAC I-slice path still refuses `mb_type` 0.
 
 **What's explicitly NOT implemented / not yet working** (out of scope, or
 a known limitation — see below for exactly which):
@@ -442,8 +593,10 @@ a known limitation — see below for exactly which):
   "Pixel decode: CABAC + P-slice (inter)" below for exactly what (`P_Skip`/
   `P_L0_16x16`) and what's still out of scope (sub-partitioned inter,
   intra-coded macroblocks within a CABAC P-slice, B-slices).
-- CABAC + `I_NxN`/`I_8x8`/`I_PCM` (same throw-on-unsupported-`mb_type`
-  discipline as CAVLC, via the shared `i16x16-mb-info`).
+- CABAC + `I_NxN`/`I_8x8`/`I_PCM` — the throw-on-unsupported-`mb_type`
+  discipline via the shared `i16x16-mb-info`. NOTE this is now a real
+  ASYMMETRY rather than a shared limitation: CAVLC decodes `I_NxN`
+  (Intra_4x4) and CABAC does not.
 - `transform_size_8x8_flag`/8x8-transform CABAC contexts (High-Profile-only
   — this repo's `h264.pps` doesn't even parse the field, see that
   namespace's docstring).
@@ -699,9 +852,13 @@ slice NAL and ignores anything else, so existing callers are unaffected.
 - **`coded_block_pattern` (§9.1.2 Table 9-4 ME(v) mapping, Inter column
   only)**: `golomb-to-inter-cbp`, transcribed from FFmpeg's
   `ff_h264_golomb_to_inter_cbp` (`libavcodec/h264data.c`) and verified to
-  be a full permutation of 0..47. The Intra_4x4/Intra_8x8 CBP-mapping
-  column is NOT implemented, since this repo's decoder never reaches that
-  case (`I_NxN` throws before any CBP read would happen).
+  be a full permutation of 0..47. Table 9-4's OTHER (Intra) column is now
+  also implemented, as `golomb-to-intra-cbp`, for the Intra_4x4 path — it
+  is a genuinely different permutation, so reading the inter table for an
+  `I_NxN` macroblock yields a wrong-but-plausible cbp and desyncs the
+  residual reader a few blocks later. Both are asserted to be full
+  permutations of 0..47 in `decode_test.clj`
+  (`cbp-tables-are-permutations`).
 - **Chroma residual is UNCHANGED** — `decode-chroma-dc!`/
   `decode-chroma-ac-blocks!` are reused as-is for inter macroblocks; the
   chroma DC(2x2 Hadamard)+AC residual structure doesn't depend on the luma

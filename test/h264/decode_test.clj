@@ -208,7 +208,158 @@
               "luma: DC (mb0, no neighbors), then Vertical/Horizontal per real encoder RD choice — 12 of 16 macroblocks Horizontal"))))))
 
 (deftest unsupported-mb-type-throws
-  (testing "mb_type 0 (I_NxN / Intra_4x4) is out of scope and throws rather than mis-decoding"
-    (is (thrown? clojure.lang.ExceptionInfo (#'decode/i16x16-mb-info 0))))
+  (testing "Intra_8x8 — the OTHER thing mb_type 0 (I_NxN) can mean — is STILL
+     unsupported and is refused, not silently decoded with the Intra_4x4
+     modes. This test used to assert that I_NxN as a whole was rejected; it
+     now asserts only what is genuinely still out of scope, and pins the
+     reason literal so the refusal cannot quietly become a different one."
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (#'decode/reject-intra-8x8! 100)))]
+      (is (= "Intra_8x8 (transform_size_8x8_flag) not implemented" (:reason (ex-data e)))))
+    (testing "and it refuses for the reason it names: a Baseline stream, where
+       transform_8x8_mode_flag cannot be present at all, is NOT refused"
+      (is (nil? (#'decode/reject-intra-8x8! 66)))
+      (is (nil? (#'decode/reject-intra-8x8! 77)))))
   (testing "mb_type 25 (I_PCM) is out of scope and throws"
-    (is (thrown? clojure.lang.ExceptionInfo (#'decode/i16x16-mb-info 25)))))
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (#'decode/i16x16-mb-info 25)))]
+      (is (= "I_PCM not implemented" (:reason (ex-data e))))))
+  (testing "mb_type 0 still throws on the Intra_16x16 path itself — Intra_4x4 is
+     reached by dispatch in `decode-macroblock!`, not by this function, and the
+     two paths that do NOT dispatch (CABAC I-slices, P-slice intra macroblocks)
+     must keep refusing rather than mis-decoding"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (#'decode/i16x16-mb-info 0)))]
+      (is (= "I_NxN (Intra_4x4) is implemented for CAVLC I-slices only; not for CABAC or P-slice intra macroblocks"
+             (:reason (ex-data e)))))))
+
+;; --- Intra_4x4 (I_NxN) — added by the Intra_4x4 increment. ---
+
+(def ^:private ffmpeg-mb-types-i4x4-mandel64
+  "GROUND TRUTH from ffmpeg itself, NOT from this decoder: the per-macroblock
+   type ffmpeg's own H.264 decoder reports for `i4x4-mandel64.h264`, obtained
+   with
+
+     ffmpeg -v debug -debug mb_type -i i4x4-mandel64.h264 -f null -
+
+   whose `New frame, type: I` block prints one letter per macroblock in
+   raster order (`I` = Intra_16x16, `i` = I_NxN/Intra_4x4):
+
+      0  I  i  i  i
+     16  i  i  i  i
+     32  i  i  i  i
+     48  i  i  i  i
+
+   i.e. macroblock 0 is Intra_16x16 and the other 15 are Intra_4x4 — which
+   independently agrees with x264's own encode-time summary for this file,
+   `mb I  I16..4:  6.2%  0.0% 93.8%` (1/16 and 15/16).
+
+   This vector exists so `assert-i4x4-coverage!` can check the fixture
+   against something OTHER than the code under test. Asserting only that
+   the decoder's own `:mb-i4x4?` is 'mostly true' would be satisfied by a
+   decoder that mislabels macroblocks, and asserting nothing at all would
+   let a fixture that quietly re-encoded as all-Intra_16x16 pass this file's
+   pixel comparison without executing one line of the Intra_4x4 path."
+  (vec (cons false (repeat 15 true))))
+
+(defn- assert-i4x4-coverage!
+  "Refuse to report a pass for an Intra_4x4 golden vector whose bitstream
+   does not actually exercise Intra_4x4. Runs BEFORE the pixel comparison,
+   and throws (rather than returning a boolean the caller might drop) so a
+   fixture regenerated with different encoder settings fails loudly instead
+   of silently narrowing what the test covers.
+
+   Three separate things are checked, because each can be true while the
+   others are false:
+   1. every macroblock is the type ffmpeg said it was
+     (`ffmpeg-mb-types-i4x4-mandel64`);
+   2. `:mb-pred-modes` is nil exactly where `:mb-i4x4?` is true — the two
+      views of the same fact must agree, so a state map that forgot to set
+      `:i4x4?` cannot pass;
+   3. all nine §8.3.1.2 prediction modes 0..8 actually occur somewhere in
+      the picture. x264's own encode log for this file reports a non-zero
+      share for every one of them (`i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 3% 15%
+      20% 15% 12% 7% 13% 5% 9%`), so this is a real property of the
+      bitstream and not a restatement of the decoder's output. Without it,
+      a fixture could contain I_NxN macroblocks that only ever use DC and
+      Horizontal, leaving the six directional modes — where the arithmetic
+      is genuinely intricate — unexecuted."
+  [result expected-i4x4?]
+  (let [actual (:mb-i4x4? result)
+        modes (->> (:mb-i4x4-modes result) (remove nil?) (apply concat) set)
+        missing (remove modes (range 9))]
+    (when-not (= expected-i4x4? actual)
+      (throw (ex-info "Refusing to report a pass: this fixture's macroblock types do not match ffmpeg's own mb_type dump"
+                      {:expected expected-i4x4? :actual actual})))
+    (when-not (some true? actual)
+      (throw (ex-info "Refusing to report a pass: no I_NxN macroblock in this fixture, so the Intra_4x4 path never ran"
+                      {:mb-i4x4? actual})))
+    (when-not (= (mapv nil? (:mb-pred-modes result)) actual)
+      (throw (ex-info "Refusing to report a pass: :mb-pred-modes and :mb-i4x4? disagree about which macroblocks are I_NxN"
+                      {:mb-i4x4? actual :mb-pred-modes (:mb-pred-modes result)})))
+    (when (seq missing)
+      (throw (ex-info "Refusing to report a pass: this fixture does not exercise every Intra_4x4 prediction mode"
+                      {:missing-modes (vec missing) :present (vec (sort modes))})))
+    {:i4x4-macroblocks (count (filter true? actual))
+     :distinct-modes (count modes)}))
+
+(deftest cbp-tables-are-permutations
+  (testing "both Table 9-4 columns are full permutations of 0..47 — a transcription
+     typo that duplicated or dropped a value would otherwise only surface as a
+     decode mismatch on whichever stream happened to hit the affected codeNum"
+    (is (= (range 48) (sort @#'decode/golomb-to-inter-cbp)))
+    (is (= (range 48) (sort @#'decode/golomb-to-intra-cbp)))
+    (is (not= @#'decode/golomb-to-inter-cbp @#'decode/golomb-to-intra-cbp)
+        "the intra and inter columns are genuinely different mappings — reading
+         the inter table for an I_NxN macroblock desyncs the residual reader")))
+
+(deftest i4x4-mandel64-golden-vector
+  (let [bytes (rd "h264/fixtures/i4x4-mandel64.h264")]
+    (testing "i4x4-mandel64.h264 — 64x64 (4x4=16 macroblocks), REAL libx264
+     (Constrained Baseline, CAVLC) Annex B stream, generated:
+       ffmpeg -f lavfi -i \"mandelbrot=size=64x64:rate=1\" -frames:v 1 \\
+         -pix_fmt yuv420p src64.y4m
+       x264 --input-res 64x64 --fps 25 -o i4x4-mandel64.h264 --qp 26 \\
+         --keyint 1 --no-deblock --partitions i4x4 --profile baseline src64.y4m
+
+     Every earlier fixture in this file is FLAT or direction-degenerate for a
+     structural reason: libx264 cannot be told to avoid Intra_4x4
+     (`--partitions none` still leaves `analyse=0x1:0`, and that `0x1` is
+     `X264_ANALYSE_I4x4`), so only content with no texture at all encodes
+     without I_NxN macroblocks. Every fixture this repo had was flat for
+     exactly that reason, which is why the decoder could pass its whole suite
+     while rejecting anything a real encoder emits from real content. This
+     fixture is deliberately the opposite: a Mandelbrot render, i.e. texture
+     at every scale, at a QP where x264 chooses I_NxN for 15 of the 16
+     macroblocks and uses ALL NINE §8.3.1.2 prediction modes (its own log:
+     `i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 3% 15% 20% 15% 12% 7% 13% 5% 9%`).
+
+     `--no-deblock` for the same reason as `horizontal-multimb64.h264`: real
+     texture produces real block-boundary discontinuities, and this repo has
+     no deblocking filter, so the flag has to be set for ffmpeg's own
+     reconstruction to be the right thing to compare against.
+
+     Reference pixels are ffmpeg's OWN decode of this same file
+     (`ffmpeg -i i4x4-mandel64.h264 -pix_fmt yuv420p i4x4-mandel64.ref.yuv`),
+     compared bit-exact with no tolerance — luma AND chroma."
+      (let [result (decode/decode-idr-frame bytes)
+            ;; STRUCTURAL assertion first: refuse to compare pixels at all
+            ;; unless the bitstream really does contain I_NxN macroblocks
+            ;; using every prediction mode. See `assert-i4x4-coverage!`.
+            coverage (assert-i4x4-coverage! result ffmpeg-mb-types-i4x4-mandel64)
+            ref (rd "h264/fixtures/i4x4-mandel64.ref.yuv")
+            luma-ref (vec (take 4096 ref))
+            cb-ref (vec (subvec (vec ref) 4096 5120))
+            cr-ref (vec (subvec (vec ref) 5120 6144))]
+        (testing "the fixture genuinely exercises Intra_4x4 (structural, checked before any pixel comparison)"
+          (is (= 15 (:i4x4-macroblocks coverage)))
+          (is (= 9 (:distinct-modes coverage))))
+        (testing "dimensions from SPS"
+          (is (= 64 (:width result)))
+          (is (= 64 (:height result))))
+        (testing "reconstructed luma plane is bit-exact vs. real ffmpeg decode
+           (real Intra_4x4: all nine prediction modes, the §8.3.1.1
+            neighbour-derived predIntra4x4PredMode across macroblock
+            boundaries, Table 9-4's INTRA coded_block_pattern column, and the
+            §8.3.1.2 p[4..7,-1] substitution)"
+          (is (= luma-ref (:luma result))))
+        (testing "reconstructed Cb/Cr planes are bit-exact vs. real ffmpeg decode"
+          (is (= cb-ref (:cb result)))
+          (is (= cr-ref (:cr result))))))))
