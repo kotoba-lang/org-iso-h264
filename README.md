@@ -72,6 +72,8 @@ below for exactly what is/isn't covered).
 | `h264.sps-table` | the table-driven counterpart of `h264.sps/parse`, built to be COMPARED with it rather than to replace it: `resources/h264/syntax/sps.edn` (§7.3.2.1.1 as data) + `h264.syntax` + a 12-line §7.4.2.1.1 `semantics` fn + an 8-line `scaling-list-escape`. `h264.sps` remains the shipping parser |
 | `h264.quant` | dequantization: the `normAdjust4x4` V-table (§8.5.9) + per-position `ac-qmul`/single-scalar `dc-qmul`. Implements `codec-primitives.quant/QuantScale`. Baseline scope only — no custom scaling lists (flat weight 16 everywhere) |
 | `h264.transform` | decode: the integer 4x4 inverse transform (`inverse-4x4`, §8.5.10) + the Intra16x16 luma DC Hadamard transform (`luma-dc-hadamard`) + the chroma-DC 2x2 Hadamard transform (`chroma-dc-hadamard`). Arithmetic ported 1:1 from FFmpeg's reference decoder for bit-exactness, including an internal coefficient-array transpose whose necessity was discovered empirically (see "Pixel decode" below). encode: `forward-4x4` (textbook forward transform, API symmetry/DC-extraction only) + `forward-luma-dc-hadamard` (exact derived inverse of `luma-dc-hadamard`) + `forward-chroma-dc-hadamard` (exact derived inverse of `chroma-dc-hadamard`, same probe-and-invert methodology) — see "Pixel encode" below |
+| `h264.transform` (`.kotoba`) | the same 8.5.12 inverse transform as a JVM-free guest kernel: the 1-D butterfly `idct4-1d` plus `idct4-1d-dc` (+32 DC bias folded in), `idct4-1d-scaled` (final `>>6` folded in) and `dc-only-sample`. Compiles to wasm32 with ZERO host imports and to aarch64/x86_64 machine code. The `.cljc` above stays authoritative; see "A residual kernel that runs with no JVM under it" below |
+| `h264.quant` (`.kotoba`) | the 8.5.9 dequant chain and 8.5.8 `chroma-qp` as a JVM-free guest kernel: `group-idx`, `level-scale`, `ac-qmul`, `dc-qmul`, `dequant-ac`, `chroma-qp`. Same shape and same rules as the transform kernel |
 | `h264.cavlc` | decode: CAVLC residual entropy decode (§9.2): `coeff_token`/`total_zeros`/`run_before` VLC tables (luma AND the ChromaArrayType 1 chroma-DC `nC==-1` special case) + `residual-block!` (coeff_token → trailing-ones signs → level_prefix/suffix → total_zeros → run_before → position reconstruction). encode: `encode-residual-block!`, reusing the same tables as reverse lookups (already generic over `:chroma-dc` — no chroma-specific CAVLC encode code was needed; also reused UNCHANGED for P_L0_16x16's full 16-coefficient regular luma blocks, see "Pixel encode: P-slice (inter)") |
 | `h264.encode` | encode-side orchestration: quantization (exact least-squares solve, NOT a memorized MF table, reused unchanged for chroma via QPc) → CAVLC → simplified SAD-based mode decision (luma Intra_16x16 AND chroma Intra_Chroma, jointly for Cb+Cr) → macroblock loop → NAL assembly. LUMA AND CHROMA (Cb/Cr, 4:2:0). See "Pixel encode" below. ALSO: `encode-gop` — P-slice (P_Skip/P_L0_16x16) inter encode: integer-pel full-search + quarter-pel local-refinement motion estimation (`h264.interp`-scored), P_Skip mode decision, full-16-coefficient-regular-block luma residual quantization, chroma residual UNCHANGED from the intra path — see "Pixel encode: P-slice (inter)" below |
 | `h264.intra-pred` | Intra_16x16 luma prediction (§8.3.3): DC/Vertical/Horizontal (modes 0/1/2) only — Plane (mode 3) throws. **Intra_4x4 luma prediction (§8.3.1.2, `predict-4x4`): ALL NINE modes** (Vertical/Horizontal/DC/Diagonal_Down_Left/Diagonal_Down_Right/Vertical_Right/Horizontal_Down/Vertical_Left/Horizontal_Up), including §8.3.1.2's `p[4..7,-1]` substitution — see "Pixel decode: Intra_4x4" below; Intra_8x8 (§8.3.2) is refused, not approximated. Note Table 8-2's Intra_4x4 numbering is a THIRD numbering, distinct from both Intra_16x16's and Table 8-5's chroma one. Intra_Chroma prediction (§8.3.4, 4:2:0 8x8 blocks, `predict-chroma-8x8`): ALL FOUR modes (DC/Horizontal/Vertical/Plane) on decode — see "Chroma decode" below for why Plane is implemented here but not for luma; encode's mode decision only ever selects DC/Horizontal/Vertical (see "Pixel encode") |
@@ -107,6 +109,13 @@ order count type 0 or 2, progressive or interlaced dimensions, and optional
 POC type 1, and non-Baseline profiles fail closed. The existing `.cljc`
 implementation remains the wider semantic oracle; unsupported high-profile
 and scaling-list syntax has not been silently claimed by the Kotoba profile.
+
+`src/h264/transform.kotoba` and `src/h264/quant.kotoba` are a different kind
+of consumer: not a bounded reader over a bitstream, but the decode
+*arithmetic* — the §8.5.12 inverse transform and the §8.5.9 dequant chain.
+They are the two that actually reach a backend and get executed today, and the
+only ones with no `:require` and no typed value anywhere, which is why. See "A
+residual kernel that runs with no JVM under it" below.
 
 The conformance roots are `test/h264/expgolomb_conformance.kotoba` and
 `test/h264/sps_conformance.kotoba`. Both must return `42` on the restricted Web
@@ -1478,6 +1487,183 @@ are `0`/`1` ints, so `[:= [:var :some_flag] 1]` is required.
 Full design, the measurement, the three deliberate breakages that show the
 equivalence test fails for the reason it names, and the reach estimate across
 this ecosystem's other spec repos: `docs/adr/2608290100-table-driven-bitstream-syntax.edn`.
+
+## A residual kernel that runs with no JVM under it
+
+The decoder above is full Clojure on the JVM. This section is one vertical
+slice of it that is not: `src/h264/transform.kotoba` and
+`src/h264/quant.kotoba` are compiled by `bin/amu` and executed, on real
+fixture data, with `java`, `javac`, `clojure` and `clj` shadowed out of `PATH`
+by stubs that exit 127.
+
+The `.cljc` decoder is untouched and remains authoritative. The `.kotoba`
+kernels sit beside it with an equivalence corpus, exactly as
+`src/h264/syntax.kotoba` sits beside `syntax.cljc`.
+
+### What is in the kernel, and why it is 1-D
+
+`h264.transform` (Kotoba) exports H.264 §8.5.12.2's **1-D inverse integer
+butterfly** — `idct4-1d`, plus `idct4-1d-dc` (same butterfly with the +32 DC
+bias folded in) and `idct4-1d-scaled` (same butterfly with the final `>>6`
+folded in) — and `dc-only-sample`. `h264.quant` (Kotoba) exports the whole
+§8.5.9 dequant chain: `group-idx`, `level-scale`, `ac-qmul`, `dc-qmul`,
+`dequant-ac`, and §8.5.8's `chroma-qp`.
+
+The exported unit is the 1-D operator rather than `inverse-4x4` because
+sixteen coefficients cannot cross an exported boundary at all today. A
+`:vector-i64` parameter is rejected by the native backends; sixteen scalar
+parameters exceed `guest-grammar.edn`'s `:max-parameters 5`. That is a real
+constraint, not a workaround: H.264's 2-D inverse transform is *separable* and
+is defined as two passes of exactly this 1-D operator, so the 1-D operator is
+the spec's own primitive. The host performs the eight calls and the index
+permutation and performs **no arithmetic of its own** — the DC bias and the
+final shift live inside the kernel, which is why those two variants exist.
+
+The composition is written once, in `scripts/kotoba_kernel_common.cljs`, and
+all three executions drive it.
+
+### What actually ran, and what it agreed with
+
+| path | how it runs | JVM? | result |
+|---|---|---|---|
+| reference | `kotoba.kir/execute`, the language's own interpreter, under nbb | no | 9,540 values compared, 0 mismatches |
+| wasm | the emitted `wasm32` modules, instantiated by node | no | 9,540 values compared, 0 mismatches |
+| native | the emitted `aarch64` machine code, extracted by symbol and run through amu's W^X kexe loader | no | 8 real blocks, 128 residual samples, 0 mismatches |
+
+All three drive the same composition and are compared against the same
+`.cljc`-derived expectations, so they are held to one answer rather than to
+each other. `java`, `javac`, `clojure` and `clj` were shadowed by exit-127
+stubs throughout, and the marker file they write was never created.
+
+The native figure is small for a mechanical reason and not a hedged one: the
+kexe loader takes one call per process, so 317 blocks × 32 calls is not a
+thing you run, and the eight are *chosen* — largest magnitude, most negative
+coefficients, DC-only, all-zero, plus the head of the list — rather than
+whatever came first.
+
+**The native path is currently blocked, and the block is a regression in the
+compiler rather than in this kernel.** The native result above was taken at
+amu `02c7e57`. amu has since advanced to `0df9d99`, and at that revision
+`extract-native` rejects *both* kernels with
+`:kotoba/verification-failed "native export table rejected"` — including the
+transform module that had extracted and executed cleanly one revision earlier.
+`scripts/verify-kotoba-kernel.cljs --native` therefore reports
+`NATIVE-aarch64-transform` and `NATIVE-aarch64-quant` as UNVERIFIED and exits
+3 today. It reports them; it does not count them as passes.
+
+The emitted `wasm32` modules declare **zero host imports** — 676 bytes for
+`transform`, 1,336 for `quant` — and the verifier fails the run if that ever
+stops being true. That is the payoff of keeping every export scalar: a
+`:vector-i64` or record parameter compiles for wasm too, but pulls in the
+45-function `kotoba:typed` import surface, and the module stops being
+self-contained.
+
+The two entrypoints agree byte for byte: compiling `transform.kotoba` to
+`wasm32` through the JVM CLI and through `bin/amu`'s JDK-free path at the same
+amu revision produces the identical 676-byte module, and the two give the same
+answers when run.
+
+The oracle is `resources/h264/kotoba-vectors/kernel-vectors.edn`. Every
+expectation in it was produced by *this repo's `.cljc` decoder*, and every
+inverse-transform input is a coefficient block the decoder actually passed to
+`inverse-4x4` while decoding the real libx264 fixtures — `i4x4-mandel64`,
+`gradient16-ac`, `chroma-multimb32`, `horizontal-multimb64`,
+`flat16-dc-only`. Nobody invented an input. 317 distinct blocks: 189 with more
+than four non-zero coefficients, 287 containing negative coefficients,
+coefficients up to 3,584 in magnitude.
+
+```sh
+nbb --classpath scripts scripts/verify-kotoba-kernel.cljs --amu <amu-checkout>
+nbb --classpath scripts scripts/verify-kotoba-kernel.cljs --amu <amu-checkout> --native
+```
+
+Exit 0 is a clean pass, 1 is a mismatch, and **3 is UNVERIFIED** — a path that
+could not be run at all, or an evidence floor that was not met. A check that
+could not run must not return the same value as one that ran clean.
+
+`scripts/verify-kotoba-kernel-controls.cljs` is what makes the comparison
+worth running. It breaks the guest kernels one edit at a time in a throwaway
+copy of the tree — a truncating division where H.264 wants an arithmetic
+shift, a wrong `+32` rounding bias, a dropped `>>1` inside the butterfly, one
+wrong digit of the `normAdjust4x4` table — and requires the verifier to reject
+each broken copy *in the group the edit is in*. That last clause earned its
+place: the first run of the controls reported one of them as unproven, because
+the verifier printed only its first three sample failures and the broken table
+happened to fail `level-scale` three times before it reached `ac-qmul`. The
+verifier now prints a `FAILING-GROUPS` line carrying every failing group.
+
+`test/h264/kotoba_kernel_vectors_test.clj` is the other half. The verifier has
+no JVM, so it cannot ask the decoder anything; it can only compare against a
+file. That test is what makes the file worth comparing against: it re-derives
+every expectation from the current `.cljc` code, re-decodes the fixtures to
+prove every recorded coefficient block really came out of a bitstream, and
+refuses a corpus too degenerate to discriminate (it requires blocks with real
+AC content, blocks with negative coefficients, and coefficients large enough to
+exercise both butterfly stages — a corpus of flat blocks would pass an inverse
+transform that ignored every AC coefficient, and a corpus with no negatives
+would pass a truncating division in place of H.264's arithmetic right shift).
+
+### What this proves, and what it does not
+
+It proves the path is open: a real, bit-exactness-critical piece of H.264
+decode arithmetic, written in guest grammar, compiles through the JDK-free
+front door to both Wasm and native machine code, executes with no JVM
+underneath it, and agrees with the JVM decoder on data that came out of a real
+bitstream.
+
+It does not make the decoder JVM-free, and the gap is not small. A profile of
+this decoder — taken previously, and *not* re-measured by this work, so treat
+the three figures as the order of magnitude they are — attributes about 78% of
+leaf samples to Clojure persistent-collection machinery and about 85% of
+decoder-attributed samples to picture assembly and residual addition. **The
+transform is 3.4%.** What remains is precisely the part this kernel's shape
+cannot yet reach: picture assembly moves planes, and
+a plane is bulk data, which is what the guest value model has no carrier for.
+A 256×256 luma plane exactly exhausts the native arena; 1920×1080 exceeds it
+thirtyfold. Closing the rest is a value-model problem, not a translation
+problem.
+
+### Compiler blockers met on the way
+
+Minimal reproductions, with exact invocations, exit codes and full diagnostic
+maps, are checked in under `test/h264/kotoba-compiler-repro/`
+(`reproductions.edn` is the index, and it names which amu answered each one —
+amu moved from `02c7e57` to `0df9d99` while this work was in progress, so a
+single revision number here would be wrong). In short:
+
+- `bit-shift-left`, `bit-shift-right`, `unsigned-bit-shift-right`, `mod`,
+  `rem`, `min`, `max` and `/` have **no admitted lowering**, though
+  `guest-grammar.edn`'s `:admitted-builtins` lists all eight. `quot`,
+  `bit-and`, `bit-or`, `bit-xor`, `inc`, `dec`, `cond` and `case` from the same
+  set are admitted. H.264 is specified in arithmetic shifts, so every shift in
+  these kernels is spelled as floor division or as multiplication by a power of
+  two. Both are exact; both are commented, so that nobody "simplifies" them
+  into `quot`, which truncates toward zero and would move every negative
+  residual by one.
+- `hetero-vector-at` **crashes the wasm emitter on the JDK-free entrypoint**
+  (`:kotoba/internal-error`) on a four-line file that `amu check` accepts.
+  Constructing the same tuple without reading it back compiles fine. At the
+  same amu revision the JVM entrypoint compiles the crashing file with exit 0,
+  so it is a defect on `bin/amu`'s path specifically and not a property of the
+  language. This is why `expgolomb.kotoba`, whose every result is read with
+  `hetero-vector-at`, has no wasm32 artifact.
+- `extract-native` rejects with
+  `:kotoba/verification-failed "native export table rejected"`. At `02c7e57`
+  this hit `quant.kexe` only, for all six of its exports, while
+  `transform.kexe` from the same run extracted all four of its own; at
+  `0df9d99` it hits both. The verifier compares the artifact's stored export
+  table against a re-emission of the artifact's own KIR, and re-emission is
+  deterministic here (running the emitter twice gives the identical table),
+  so the disagreement is between compile-time and verify-time emission. Three
+  obvious shrink candidates — a self-recursive function, a long `cond` chain,
+  one export calling another — do not reproduce it. This is the only reason
+  the native column above is 128 samples rather than the whole corpus, and
+  the only reason `--native` exits 3 today.
+- The native backends reject a `:vector-i64` parameter and accept a
+  **sixteen-field `:i64` record** in the same position, at arity 2. So a whole
+  4x4 block *can* reach a native export; what it costs is the Wasm module's
+  zero-import property. That trade, not the parameter limit, is the next real
+  decision for widening this kernel.
 
 ## Test
 
