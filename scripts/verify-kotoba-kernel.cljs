@@ -33,7 +33,7 @@
   exit 3  UNVERIFIED -- a path could not be run at all, or an evidence
           floor was not met. Deliberately neither 0 nor 1, because 'could
           not measure' must not return the same value as 'measured clean'."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba-kernel-common :as common]
             ["node:child_process" :as child]
             ["node:fs" :as fs]

@@ -20,7 +20,7 @@
   exit 0  every control was detected, in the expected vector group
   exit 1  a control went undetected, or was detected in the wrong group
   exit 3  UNVERIFIED -- the controls could not be run"
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             ["node:child_process" :as child]
             ["node:fs" :as fs]
             ["node:os" :as os]
@@ -112,7 +112,7 @@
          (finally (fs/rmSync dir #js {:recursive true :force true})))))))
 
 (doseq [{:keys [id state why]} results]
-  (println (str "CONTROL\t" id "\t" (str/upper-case (name state))
+  (println (str "CONTROL\t" id "\t" (str/upper (name state))
                 (when why (str "\t" why)))))
 (println (str "CONTROLS\tRUN\t" (count results)
               "\tDETECTED\t" (count (filter #(= :detected (:state %)) results))))
