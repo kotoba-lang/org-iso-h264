@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 (ns verify-kotoba-kernel-controls
   "Negative controls for `verify-kotoba-kernel.cljs`.
 
@@ -14,7 +14,7 @@
   truncating division where H.264 wants an arithmetic shift, a wrong rounding
   bias, and a dropped `>>1` inside the butterfly.
 
-  usage: nbb --classpath scripts scripts/verify-kotoba-kernel-controls.cljk
+  usage: kbb --backend sci --classpath scripts scripts/verify-kotoba-kernel-controls.cljk
              --amu <amu-checkout>
 
   exit 0  every control was detected, in the expected vector group
