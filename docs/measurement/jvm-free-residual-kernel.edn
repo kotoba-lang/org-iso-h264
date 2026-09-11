@@ -12,8 +12,8 @@
 ;; and are each compared against the same corpus.
 ;;
 ;; Reproduce:
-;;   nbb --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu> [--native]
-;;   clojure -M:test -n h264.kotoba-kernel-vectors-test
+;;   kbb --backend sci --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu> [--native]
+;;   kbb -M:test -n h264.kotoba-kernel-vectors-test
 
 {:format :h264.jvm-free-residual-kernel-measurement/v1
  :measured "2026-08-30"
@@ -101,7 +101,7 @@
                :meaning "java/javac/clojure/clj were shadowed by exit-127 stubs
                          for every run above and the marker file they write was
                          never created"}
-  :jvm-test-suite {:command "clojure -M:test" :tests 142 :assertions 7304
+  :jvm-test-suite {:command "kbb -M:test" :tests 142 :assertions 7304
                    :failures 0 :errors 0
                    :was-before-this-work "137 tests, 7280 assertions"}
   :corpus-regeneration {:command "scripts/gen_kernel_vectors.cljk"

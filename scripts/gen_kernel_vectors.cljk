@@ -6,7 +6,7 @@
   block that a REAL libx264-encoded fixture actually produced while being
   decoded — not a value anyone invented. Run with:
 
-      clojure -M:test -m gen-kernel-vectors"
+      kbb -M:test -m gen-kernel-vectors"
   (:require [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [h264.decode :as decode]

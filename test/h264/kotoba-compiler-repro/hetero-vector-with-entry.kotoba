@@ -1,6 +1,6 @@
 (ns hetero-vector-with-entry (:export [main]))
 ;; Discriminator for reproduction 4. The JVM compiler path
-;; (`clojure -M:kotoba`, which this repo's CI uses) rejects the entryless
+;; (`kbb -M:kotoba`, which this repo's CI uses) rejects the entryless
 ;; wasm32-hetero-vector.kotoba with a DIFFERENT and informative diagnostic:
 ;;   :error :target, :message "entryless libraries currently require the
 ;;   kotoba-script web target", :details {:phase :target

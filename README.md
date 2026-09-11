@@ -1573,8 +1573,8 @@ than four non-zero coefficients, 287 containing negative coefficients,
 coefficients up to 3,584 in magnitude.
 
 ```sh
-nbb --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu-checkout>
-nbb --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu-checkout> --native
+kbb --backend sci --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu-checkout>
+kbb --backend sci --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu-checkout> --native
 ```
 
 Exit 0 is a clean pass, 1 is a mismatch, and **3 is UNVERIFIED** — a path that
@@ -1668,7 +1668,7 @@ single revision number here would be wrong). In short:
 ## Test
 
 ```sh
-clojure -M:test
+kbb -M:test
 ```
 
 ## The guest-grammar reader does not pass `amu check` yet

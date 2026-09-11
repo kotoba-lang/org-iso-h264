@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 (ns kotoba-kernel-reference
   "Run this repo's `.kotoba` residual kernels through `kotoba.kir/execute`,
   the language's own reference interpreter, and compare every case against
@@ -7,7 +7,7 @@
 
   Launched by `verify-kotoba-kernel.cljs` with amu's resolved classpath.
 
-  usage: nbb --classpath <amu classpath> scripts/kotoba-kernel-reference.cljk
+  usage: kbb --backend sci --classpath <amu classpath> scripts/kotoba-kernel-reference.cljk
              --vectors <edn> [--quant-limit N]
 
   Prints one `REFERENCE\tCHECKED\tn\tFAILURES\tm` line; exits 0 clean,

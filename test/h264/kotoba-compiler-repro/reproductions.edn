@@ -6,12 +6,12 @@
        :front-door "bin/amu"
        :note "bin/amu routes check and every wasm32*/aarch64*/x86_64* compile
               to the nbb (JDK-free) entrypoints, which use kotoba-sema's
-              kotoba.compiler.frontend. `clojure -M:kotoba`, which this repo's
+              kotoba.compiler.frontend. `kbb -M:kotoba`, which this repo's
               CI uses, is a DIFFERENT entrypoint."}
  :version-caveat
  "CAREFUL. This repo's deps.edn :kotoba alias pins amu at 3579cfd, and at that
   revision frontend.cljc still lived INSIDE amu; by 02c7e57 it has moved out to
-  kotoba-lang/kotoba-sema. So `clojure -M:kotoba` and `bin/amu` here are not
+  kotoba-lang/kotoba-sema. So `kbb -M:kotoba` and `bin/amu` here are not
   only two entrypoints, they were two different FRONTEND VERSIONS. Any
   nbb-versus-JVM difference measured that way is confounded, and the entries
   below say which amu answered. Where an uncoupled comparison was run, it is
@@ -27,7 +27,7 @@
 
  :deliberately-not-advancing-the-amu-pin
  "This repo's deps.edn :kotoba alias is LEFT at amu 3579cfd on purpose, not by
-  neglect. Advancing it would move `clojure -M:kotoba` onto the same frontend
+  neglect. Advancing it would move `kbb -M:kotoba` onto the same frontend
   bin/amu uses, which is the frontend that crashes on `hetero-vector-at` --
   and the three conformance roots this repo already compiles that way
   (expgolomb, sps, ebsp) all read their results with hetero-vector-at.
@@ -152,7 +152,7 @@
      :code :kotoba/internal-error
      :note "has a main entry, so the JVM path's entryless explanation does
             not apply, and the nbb path still crashes"}
-    {:file "wasm32-hetero-vector.kotoba" :compiler "clojure -M:kotoba (amu 3579cfd, OLDER frontend)"
+    {:file "wasm32-hetero-vector.kotoba" :compiler "kbb -M:kotoba (amu 3579cfd, OLDER frontend)"
      :target "wasm32-browser" :exit 70
      :diagnostic {:error :target :code :kotoba/internal-error
                   :message "entryless libraries currently require the kotoba-script web target"

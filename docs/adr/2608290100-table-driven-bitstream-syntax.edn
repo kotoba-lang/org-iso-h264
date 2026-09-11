@@ -139,7 +139,7 @@ with a synthetic table; slice_header itself has NOT been transcribed.
 
 ## Evidence
 
-Equivalence, not mere execution. `clojure -M:test`:
+Equivalence, not mere execution. `kbb -M:test`:
 
     before this branch  124 tests  7,077 assertions  0 failures  exit 0
     after               135 tests  7,263 assertions  0 failures  exit 0
