@@ -16,7 +16,7 @@
    `init_dequant4_coeff_table`, https://github.com/FFmpeg/FFmpeg — spec
    values are widely republished, e.g. Richardson, *H.264 and MPEG-4 Video
    Compression*, table 8.4), and empirically re-verified bit-exact against
-   real libx264-encoded golden vectors in `test/h264/decode_test.clj` (this
+   real libx264-encoded golden vectors in `test/h264/decode_test.cljk` (this
    repo doesn't merely copy the table — it round-trips it through an actual
    x264-encoded stream).
 

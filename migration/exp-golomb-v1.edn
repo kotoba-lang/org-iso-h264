@@ -1,6 +1,6 @@
 {:schema "kotoba-h264-migration/v1"
  :profile :h264.expgolomb/pure-bounded-v1
- :legacy {:path "src/h264/expgolomb.cljc"
+ :legacy {:path "src/h264/expgolomb.cljk"
           :state-model :mutable-atoms
           :status :retained-semantic-oracle}
  :canonical {:path "src/h264/expgolomb.kotoba"

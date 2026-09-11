@@ -6,7 +6,7 @@
    lists are skipped correctly (bits consumed, values discarded) so the
    reader stays aligned for the fields that follow, but their content isn't
    surfaced. Validated against a real libx264-encoded (baseline profile)
-   NAL — see test/h264/sps_test.clj.
+   NAL — see test/h264/sps_test.cljk.
 
    New implementation as part of the kotoba-lang reverse-domain
    media/graphics standards-substrate split (com-junkawasaki/root)."

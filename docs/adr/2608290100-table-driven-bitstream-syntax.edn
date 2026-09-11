@@ -80,11 +80,11 @@ write from scratch, and it is the part this format deletes.
 
 ## What was built
 
-  src/h264/syntax.cljc                   204 lines  generic reader, O(1)
+  src/h264/syntax.cljk                   204 lines  generic reader, O(1)
   resources/h264/syntax/sps.edn           95 lines  §7.3.2.1.1 as DATA, O(N)
                                                     63 non-comment, 29 rows
-  src/h264/sps_table.cljc                103 lines  §7.4 semantics + escape
-  test/h264/syntax_equivalence_test.clj  292 lines  equivalence vs incumbent
+  src/h264/sps_table.cljk                103 lines  §7.4 semantics + escape
+  test/h264/syntax_equivalence_test.cljk  292 lines  equivalence vs incumbent
 
 h264.sps, h264.pps and h264.slice are UNCHANGED. They pass real golden-vector
 tests against ffmpeg output and remain the shipping parsers. Deleting working,

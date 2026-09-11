@@ -8,11 +8,11 @@
 ;; Method: `java`, `javac`, `clojure` and `clj` are shadowed on PATH by stubs
 ;; that exit 127 and append to a marker file. The run fails if the marker is
 ;; ever written, so "no JVM was used" is asserted rather than assumed. Three
-;; executions drive the SAME 2-D composition (scripts/kotoba_kernel_common.cljs)
+;; executions drive the SAME 2-D composition (scripts/kotoba_kernel_common.cljk)
 ;; and are each compared against the same corpus.
 ;;
 ;; Reproduce:
-;;   nbb --classpath scripts scripts/verify-kotoba-kernel.cljs --amu <amu> [--native]
+;;   nbb --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu> [--native]
 ;;   clojure -M:test -n h264.kotoba-kernel-vectors-test
 
 {:format :h264.jvm-free-residual-kernel-measurement/v1
@@ -36,8 +36,8 @@
 
  :corpus
  {:source "resources/h264/kotoba-vectors/kernel-vectors.edn"
-  :generator "scripts/gen_kernel_vectors.clj"
-  :guard "test/h264/kotoba_kernel_vectors_test.clj"
+  :generator "scripts/gen_kernel_vectors.cljk"
+  :guard "test/h264/kotoba_kernel_vectors_test.cljk"
   :oracle "h264.transform/inverse-4x4 and h264.quant/* — this repo's own .cljc decoder"
   :fixtures ["h264/fixtures/i4x4-mandel64.h264"
              "h264/fixtures/gradient16-ac.h264"
@@ -104,7 +104,7 @@
   :jvm-test-suite {:command "clojure -M:test" :tests 142 :assertions 7304
                    :failures 0 :errors 0
                    :was-before-this-work "137 tests, 7280 assertions"}
-  :corpus-regeneration {:command "scripts/gen_kernel_vectors.clj"
+  :corpus-regeneration {:command "scripts/gen_kernel_vectors.cljk"
                         :byte-identical-to-checked-in-file true}
   :cross-compiler
   {:claim "the JVM entrypoint and the JDK-free entrypoint emit the SAME wasm32
@@ -113,7 +113,7 @@
    :executed-answers-match true}}
 
  :negative-controls
- {:driver "scripts/verify-kotoba-kernel-controls.cljs"
+ {:driver "scripts/verify-kotoba-kernel-controls.cljk"
   :method "one textual substitution at a time, in a throwaway copy of the
            tree, requiring the verifier to reject each broken copy IN THE
            GROUP THE EDIT IS IN"

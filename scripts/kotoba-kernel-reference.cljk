@@ -7,7 +7,7 @@
 
   Launched by `verify-kotoba-kernel.cljs` with amu's resolved classpath.
 
-  usage: nbb --classpath <amu classpath> scripts/kotoba-kernel-reference.cljs
+  usage: nbb --classpath <amu classpath> scripts/kotoba-kernel-reference.cljk
              --vectors <edn> [--quant-limit N]
 
   Prints one `REFERENCE\tCHECKED\tn\tFAILURES\tm` line; exits 0 clean,

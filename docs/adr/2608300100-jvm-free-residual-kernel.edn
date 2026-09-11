@@ -52,7 +52,7 @@ is asserted, not assumed.
 The corpus is not invented. Every expectation comes from this repo's own
 `.cljc` decoder, and every one of the 317 inverse-transform inputs is a
 coefficient vector the decoder actually passed to `inverse-4x4` while decoding
-five real libx264 fixtures. `test/h264/kotoba_kernel_vectors_test.clj` is the
+five real libx264 fixtures. `test/h264/kotoba_kernel_vectors_test.cljk` is the
 half the verifier cannot do: it re-derives every expectation from the current
 `.cljc` code, re-decodes the fixtures to prove every recorded block really
 came out of a bitstream, and refuses a corpus too degenerate to discriminate.
@@ -62,7 +62,7 @@ coefficients would pass a truncating division in place of H.264's arithmetic
 right shift, which is the single easiest way to get this kernel subtly wrong.
 
 And because a comparison that cannot fail is decoration,
-`scripts/verify-kotoba-kernel-controls.cljs` breaks the guest kernels one edit
+`scripts/verify-kotoba-kernel-controls.cljk` breaks the guest kernels one edit
 at a time in a throwaway copy and requires the verifier to reject each broken
 copy IN THE GROUP THE EDIT IS IN. That last clause is not pedantry: the first
 time the controls ran, one of them went red for a different check than the one

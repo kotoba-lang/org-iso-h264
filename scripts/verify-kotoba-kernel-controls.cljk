@@ -14,7 +14,7 @@
   truncating division where H.264 wants an arithmetic shift, a wrong rounding
   bias, and a dropped `>>1` inside the butterfly.
 
-  usage: nbb --classpath scripts scripts/verify-kotoba-kernel-controls.cljs
+  usage: nbb --classpath scripts scripts/verify-kotoba-kernel-controls.cljk
              --amu <amu-checkout>
 
   exit 0  every control was detected, in the expected vector group

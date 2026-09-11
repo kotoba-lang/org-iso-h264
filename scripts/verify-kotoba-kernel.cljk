@@ -24,7 +24,7 @@
   run legitimately ends in exit 3 today, with NATIVE-transform reported as
   passed beside it.
 
-  usage: nbb --classpath scripts scripts/verify-kotoba-kernel.cljs
+  usage: nbb --classpath scripts scripts/verify-kotoba-kernel.cljk
              --amu <amu-checkout> [--native] [--vectors <edn>]
                                   [--skip-reference]
 
@@ -224,7 +224,7 @@
                                     (concat entries [(.join path amu-root "src")
                                                      (.resolve path "scripts")]))
                 r (run nbb ["--classpath" classpath
-                            (.resolve path "scripts/kotoba-kernel-reference.cljs")
+                            (.resolve path "scripts/kotoba-kernel-reference.cljk")
                             "--vectors" (.resolve path vectors-path)])]
             {:state (case (:status r) 0 :passed 1 :failed :unverified)
              :output (str (:stdout r) (:stderr r))}))))))

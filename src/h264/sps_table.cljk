@@ -2,7 +2,7 @@
   "Table-driven counterpart of `h264.sps/parse`, built to be COMPARED with it
    rather than to replace it. `h264.sps` stays the shipping parser; this
    namespace exists so the compression claim in docs/adr can be judged on
-   evidence (test/h264/syntax_equivalence_test.clj asserts the two agree,
+   evidence (test/h264/syntax_equivalence_test.cljk asserts the two agree,
    field for field, on this repo's real fixtures and on synthetic
    high-profile streams the incumbent's own tests never reach).
 
