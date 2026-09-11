@@ -20,15 +20,15 @@
 ;;   :logic       genuine code. Subdivided by :logic-kind below.
 ;;
 ;; Re-derive the class counts with:
-;;   grep -n '' src/h264/sps.cljc   | sed -n '32,87p'
-;;   grep -n '' src/h264/pps.cljc   | sed -n '30,62p'
-;;   grep -n '' src/h264/slice.cljc | sed -n '71,142p'
+;;   grep -n '' src/h264/sps.cljk   | sed -n '32,87p'
+;;   grep -n '' src/h264/pps.cljk   | sed -n '30,62p'
+;;   grep -n '' src/h264/slice.cljk | sed -n '71,142p'
 {:measurement/id :h264/syntax-table-compression-v1
  :measurement/tree "kotoba-lang/org-iso-h264@9bff54f"
  :measurement/date "2026-08-29"
 
  :units
- [{:fn "h264.sps/parse" :file "src/h264/sps.cljc" :lines [32 87]
+ [{:fn "h264.sps/parse" :file "src/h264/sps.cljk" :lines [32 87]
    :spec "§7.3.2.1.1 seq_parameter_set_data"
    :total 56 :table 34 :scaffold 6 :logic 16
    :table-lines [33 34 35 36 37 39 40 41 42 43 44 45 46 47 48 49 51 52 53
@@ -37,7 +37,7 @@
    :logic-lines [72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87]
    :logic-kinds {:derivation 7 :output-map 9 :refusal 0}}
 
-  {:fn "h264.sps/skip-scaling-list!" :file "src/h264/sps.cljc" :lines [18 25]
+  {:fn "h264.sps/skip-scaling-list!" :file "src/h264/sps.cljk" :lines [18 25]
    :spec "§7.3.2.1.1.1 scaling_list"
    :total 8 :table 3 :scaffold 2 :logic 3
    :table-lines [20 21 23] :scaffold-lines [18 22] :logic-lines [19 24 25]
@@ -46,7 +46,7 @@
           spec table whose body contains assignments rather than descriptor
           rows; it is what [:escape] exists for"}
 
-  {:fn "h264.pps/parse" :file "src/h264/pps.cljc" :lines [30 62]
+  {:fn "h264.pps/parse" :file "src/h264/pps.cljk" :lines [30 62]
    :spec "§7.3.2.2 pic_parameter_set_rbsp"
    :total 33 :table 16 :scaffold 1 :logic 16
    :table-lines [31 32 33 34 35 36 40 41 42 43 44 45 46 47 48 49]
@@ -58,7 +58,7 @@
           derivations (pic_init_qp_minus26 + 26, num_ref_idx + 1, the
           entropy_coding_mode_flag -> :cabac/:cavlc mapping)"}
 
-  {:fn "h264.slice/parse-header!" :file "src/h264/slice.cljc" :lines [71 142]
+  {:fn "h264.slice/parse-header!" :file "src/h264/slice.cljk" :lines [71 142]
    :spec "§7.3.3 slice_header"
    :total 55 :table 26 :scaffold 7 :logic 22
    :comment-only-lines-excluded 17
@@ -107,8 +107,8 @@
              descriptors are ae(v) whenever CABAC is on"}}
 
  :artifact-sizes
- {"src/h264/syntax.cljc" 204
-  "src/h264/sps_table.cljc" 103
+ {"src/h264/syntax.cljk" 204
+  "src/h264/sps_table.cljk" 103
   "resources/h264/syntax/sps.edn" {:lines 95 :non-comment-lines 63
                                    :descriptor-rows 29}
-  "test/h264/syntax_equivalence_test.clj" 292}}
+  "test/h264/syntax_equivalence_test.cljk" 292}}

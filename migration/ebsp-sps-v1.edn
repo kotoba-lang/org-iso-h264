@@ -1,6 +1,6 @@
 {:schema "kotoba-h264-ebsp-migration/v1"
  :profile :h264.sps/baseline-ebsp-bounded-v1
- :legacy {:rbsp "src/h264/rbsp.cljc" :status :retained-encode-decode-oracle}
+ :legacy {:rbsp "src/h264/rbsp.cljk" :status :retained-encode-decode-oracle}
  :canonical {:unescape "src/h264/rbsp.kotoba"
              :parser "src/h264/sps.kotoba"
              :conformance "test/h264/ebsp_conformance.kotoba"}

@@ -10,7 +10,7 @@
   head. That is this namespace's whole job. It is the reason the vectors are
   evidence and not decoration.
 
-  Regenerate with `scripts/gen_kernel_vectors.clj` if the decoder's
+  Regenerate with `scripts/gen_kernel_vectors.cljk` if the decoder's
   arithmetic ever legitimately changes."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.edn :as edn]

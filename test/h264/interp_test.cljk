@@ -4,7 +4,7 @@
    repo's P-slice sub-pel motion compensation is built on. These are
    isolated unit tests of the interpolation math itself (hand-computed
    expected values, independent of the bitstream/CAVLC machinery) —
-   `test/h264/decode_p_subpel_test.clj` covers the end-to-end (real +
+   `test/h264/decode_p_subpel_test.cljk` covers the end-to-end (real +
    hand-authored) golden-vector cross-checks against real ffmpeg."
   (:require [clojure.test :refer [deftest is testing]]
             [h264.interp :as interp]))

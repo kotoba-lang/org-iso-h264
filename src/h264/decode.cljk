@@ -35,7 +35,7 @@
      deblocking-control fields; the reconstructed picture is the raw
      (pre-deblock) reconstruction. This only matters at block boundaries
      with real pixel discontinuities; it does not affect this repo's own
-     flat/gradient golden vectors (see `test/h264/decode_test.clj`).
+     flat/gradient golden vectors (see `test/h264/decode_test.cljk`).
    - **No POC/reference-picture-buffer bookkeeping beyond what's needed to
      parse a single slice header.**
 
@@ -321,7 +321,7 @@
 ;;     a direct transcription of Table 9-4's Intra column; like the inter
 ;;     table it is cross-checked at load time to be a full permutation of
 ;;     0..47 (see `cbp-tables-are-permutations`, asserted in
-;;     test/h264/decode_test.clj) — a transcription typo that duplicated or
+;;     test/h264/decode_test.cljk) — a transcription typo that duplicated or
 ;;     dropped a value would otherwise only show up as a decode mismatch.
 (def golomb-to-intra-cbp
   [47 31 15  0 23 27 29 30  7 11 13 14 39 43 45 46
@@ -1965,7 +1965,7 @@
      ;; Intra_Chroma pred mode (0=DC/1=Horizontal/2=Vertical, Table 8-5's
      ;; OWN numbering — see `h264.intra-pred`), raster order, one entry per
      ;; macroblock — exposed so callers/tests can assert WHICH prediction
-     ;; mode a real encoder actually chose (see test/h264/decode_test.clj's
+     ;; mode a real encoder actually chose (see test/h264/decode_test.cljk's
      ;; multi-macroblock golden vector, which asserts this is non-DC for at
      ;; least one MB rather than just trusting the reconstructed pixels).
      ;; nil for inter (P_Skip/P_L0_16x16) macroblocks — see :mb-inter?/:mb-mvs

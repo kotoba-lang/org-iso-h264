@@ -19,7 +19,7 @@
    `ff_h264_luma_dc_dequant_idct`, https://github.com/FFmpeg/FFmpeg) rather
    than re-derived from the spec prose, specifically so this implementation
    is bit-exact against real x264-encoded streams decoded by a real ffmpeg
-   (the golden-vector fixtures in `test/h264/decode_test.clj` are decoded
+   (the golden-vector fixtures in `test/h264/decode_test.cljk` are decoded
    by ffmpeg itself, so matching its exact integer arithmetic — not just
    the abstract DCT math — is what makes bit-exactness possible).
 

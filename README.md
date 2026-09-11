@@ -245,7 +245,7 @@ adds real (if currently narrower-than-CAVLC) CABAC decode support; see
 "Pixel decode: CABAC" for exactly what's covered.
 
 **Golden-vector validation is real but narrow — read this before trusting
-a number beyond it.** `test/h264/decode_test.clj` validates against real
+a number beyond it.** `test/h264/decode_test.cljk` validates against real
 `ffmpeg 8.1.1`/`x264 core 165` — encoded Annex B streams, compared
 bit-exact (no tolerance) against the SAME file decoded by a real `ffmpeg`
 (not the pre-encode source image, since lossy encoding changes pixel
@@ -286,7 +286,7 @@ values) — **luma AND chroma (Cb/Cr) both**, for every fixture below:
    (`:mb-pred-modes` is `[2 1 1 1 0 1 1 1 0 1 1 1 0 1 1 1]` — 12 of 16
    Horizontal). This is the first bit-exact-validated real-encoder example
    of luma Horizontal in a multi-macroblock picture — see
-   `test/h264/decode_test.clj`'s `horizontal-multimb64-golden-vector` for
+   `test/h264/decode_test.cljk`'s `horizontal-multimb64-golden-vector` for
    the fixture's generation recipe and exactly what it exercises (both
    `CodedBlockPatternLuma` 0 and 15 paths, real cross-macroblock nC
    derivation for the Intra16x16 luma DC block specifically). This was a
@@ -354,7 +354,7 @@ i.e. right-shaped, wrong-valued) output:**
 - **Two independent bugs compounded to cause a real, previously-shipped,
   multi-macroblock CAVLC desync/wrong-pixel bug whenever libx264 selected
   Intra_16x16 LUMA HORIZONTAL prediction across macroblocks** (see
-  `test/h264/decode_test.clj`'s `horizontal-multimb64-golden-vector`, the
+  `test/h264/decode_test.cljk`'s `horizontal-multimb64-golden-vector`, the
   fixture that finally exercises this path): (1) `h264.decode/decode-macroblock!`'s
   Intra16x16 luma DC block computed its cross-MB CAVLC `nC` from the
   neighbor's OWN `:dc-nnz` (that neighbor macroblock's DC-block
@@ -481,7 +481,7 @@ Both refusals go through a pinned reason literal asserted in
 Intra_8x8 refusal does NOT fire for a Baseline `profile_idc` — i.e. that
 the check refuses for the reason it names, rather than always.
 
-**Validation** (`i4x4-mandel64-golden-vector` in `test/h264/decode_test.clj`).
+**Validation** (`i4x4-mandel64-golden-vector` in `test/h264/decode_test.cljk`).
 
 ```
 ffmpeg -f lavfi -i "mandelbrot=size=64x64:rate=1" -frames:v 1 \
@@ -613,7 +613,7 @@ a known limitation — see below for exactly which):
   long preceded CAVLC encode in this repo's own history).
 
 **Validated bit-exact (no tolerance), including multi-macroblock/
-multi-coefficient content.** `test/h264/decode_cabac_test.clj` validates 3
+multi-coefficient content.** `test/h264/decode_cabac_test.cljk` validates 3
 real `ffmpeg 8.1.1`/x264-encoded Main-profile fixtures bit-exact:
 `flat16-dc-only-cabac.h264` (single macroblock, `coded_block_flag`=0 fast
 path for every block), `gradient16-ac-cabac.h264` (single macroblock, ONE
@@ -771,7 +771,7 @@ EG0-bypass-suffix bug above used):
    see `h264.decode/decode-chroma-ac-blocks-cabac!`'s own docstring for
    the full root-cause trail.
 
-**Validated bit-exact (no tolerance).** `test/h264/decode_p_slice_cabac_test.clj`
+**Validated bit-exact (no tolerance).** `test/h264/decode_p_slice_cabac_test.cljk`
 validates 2 real `ffmpeg 8.1.1`/x264-encoded Main-profile CABAC fixtures
 bit-exact: `p-skip-flat16-cabac.h264` (2 identical flat frames, 100%
 `P_Skip` — the real-encoder log confirms `skip:100.0%`) and
@@ -832,7 +832,7 @@ slice NAL and ignores anything else, so existing callers are unaffected.
   quadrants; every mb_type this repo supported BEFORE the sub-partition
   increment happens to have a UNIFORM per-quadrant motion field, so this
   generalization is proven bit-exact-unchanged for every pre-existing
-  golden vector (see `test/h264/decode_p_slice_test.clj`/
+  golden vector (see `test/h264/decode_p_slice_test.cljk`/
   `decode_p_subpel_test.clj`, all still passing unchanged) while being
   necessary for correctness once a sub-partitioned neighbor is possible
   (see "Pixel decode: P-slice sub-partitioned inter" below).
@@ -886,7 +886,7 @@ P-slice sub-partitioned inter" below for the full scope/rationale).
 The encode side has NOT been extended for P-slices at all — `h264.encode`
 remains IDR-only.
 
-**Validation.** `test/h264/decode_p_slice_test.clj` covers 3 golden
+**Validation.** `test/h264/decode_p_slice_test.cljk` covers 3 golden
 vectors (the ORIGINAL MV=(0,0)-only increment, still passing unchanged
 now that MV=(0,0) is just the trivial case of the general sub-pel path),
 all bit-exact (no tolerance) against real `ffmpeg 8.1.1`:
@@ -987,7 +987,7 @@ decode path here.
     would have silently mispredicted whenever `P_L0_16x16`/`P_Skip` is
     adjacent to a NEWLY-sub-partitioned neighbor. Proven a pure
     generalization (not a behavior change) for every pre-existing
-    fixture: all of `test/h264/decode_p_slice_test.clj`/
+    fixture: all of `test/h264/decode_p_slice_test.cljk`/
     `decode_p_subpel_test.clj`/`decode_p_slice_cabac_test.clj` pass
     bit-exact-unchanged.
 - **Per-quadrant motion compensation** (`mc-predict-quadrants`): decomposes
@@ -1023,7 +1023,7 @@ prediction, reference-list reordering, adaptive/MMCO reference marking).
 sub_mb_type combinations on demand, and even when they do there is no way
 to CONTROL which one comes out for a targeted regression test — same
 methodology as `p-16x16-mb0-realac.h264` above, see
-`test/h264/decode_p_slice_subpartition_test.clj`'s own docstring for the
+`test/h264/decode_p_slice_subpartition_test.cljk`'s own docstring for the
 full rationale and why this remains a genuine independent-decoder
 cross-check rather than a self-consistency tautology):
 - **`p-16x8-mb0.h264`** — single 16x16 macroblock, `P_L0_L0_16x8`, zero
@@ -1048,7 +1048,7 @@ cross-check rather than a self-consistency tautology):
   an incidental pass. Real 2-D Cb/Cr gradient IDR reference (not flat)
   exercises per-quadrant CHROMA motion-compensated placement too.
 
-Additionally, `test/h264/decode_p_slice_subpartition_test.clj` covers 2
+Additionally, `test/h264/decode_p_slice_subpartition_test.cljk` covers 2
 explicit throw tests (`mb_type` 4/`P_8x8ref0`, and `P_8x8` with an
 unsupported `sub_mb_type`), matching this repo's existing
 throw-on-unsupported-syntax discipline (see `h264.decode-test`'s
@@ -1100,9 +1100,9 @@ throw on a non-zero derived motion vector.
   long as no intermediate rounding is introduced — the bug is introducing
   rounding where the reference implementation doesn't).
 
-**Validation.** `test/h264/decode_p_subpel_test.clj` covers 3 golden
+**Validation.** `test/h264/decode_p_subpel_test.cljk` covers 3 golden
 vectors, all bit-exact (no tolerance) against real `ffmpeg 8.1.1`, plus
-`test/h264/interp_test.clj` unit-tests the interpolation arithmetic
+`test/h264/interp_test.cljk` unit-tests the interpolation arithmetic
 directly (hand-computed 6-tap/bilinear values, flat-plane invariance under
 every one of the 16 luma / 64 chroma fractional combinations, and
 picture-boundary clamping) independent of the bitstream machinery:
@@ -1233,7 +1233,7 @@ step 8 implementation, so no new CAVLC encode code was needed for chroma;
 neighbor-derived `nc` where the luma-only caller never did. Slice-header
 encode is `h264.slice/encode-header!`, symmetric with `parse-header!`.
 
-**Validation.** `test/h264/encode_test.clj` covers:
+**Validation.** `test/h264/encode_test.cljk` covers:
 - Round-trip through this repo's own decoder (flat/gradient, single- and
   multi-macroblock, various QP; luma AND chroma) — bit-exact for flat
   content, small bounded error for real AC content.
@@ -1363,7 +1363,7 @@ single reference, mirroring `h264.decode/decode-gop`'s "always the
 immediately preceding decoded picture" design) but are only exercised here
 by the 2-frame (IDR+P) fixtures below.
 
-**Validation.** `test/h264/encode_p_slice_test.clj` covers both round-trip
+**Validation.** `test/h264/encode_p_slice_test.cljk` covers both round-trip
 (fast, own-decoder-only) tests AND fixed real-ffmpeg-validated fixtures,
 mirroring `h264.encode-test`'s own two-tier discipline:
 1. **`p-skip-flat-roundtrip-bit-exact`** — two IDENTICAL flat 32x32 frames:
@@ -1397,7 +1397,7 @@ mirroring `h264.encode-test`'s own two-tier discipline:
    bit-exact by an INDEPENDENT real decoder that never saw or trusted
    anything about how these bytes were constructed.
 
-`test/h264/slice_test.clj` additionally round-trips `encode-p-header!`
+`test/h264/slice_test.cljk` additionally round-trips `encode-p-header!`
 against the real, already-tested `parse-header!` (both `nal_ref_idc`=0 and
 nonzero cases, and the deblocking-field-absent case), the same discipline
 `encode-header-roundtrips` already used for the I-slice header.
@@ -1420,7 +1420,7 @@ bits.
 **Nothing here replaces anything.** `h264.sps`, `h264.pps` and `h264.slice`
 are unchanged and remain the shipping parsers; they pass real golden-vector
 tests against ffmpeg output. `h264.sps-table` exists so the design can be
-judged on evidence, and `test/h264/syntax_equivalence_test.clj` is that
+judged on evidence, and `test/h264/syntax_equivalence_test.cljk` is that
 evidence: it asserts the table-driven parse equals `h264.sps/parse`, whole map,
 on 27 SPS NALs across every fixture in the repo, on 90 SPSs spanning
 everything `h264.sps/encode` can produce, and on synthetic streams written
@@ -1519,7 +1519,7 @@ the spec's own primitive. The host performs the eight calls and the index
 permutation and performs **no arithmetic of its own** — the DC bias and the
 final shift live inside the kernel, which is why those two variants exist.
 
-The composition is written once, in `scripts/kotoba_kernel_common.cljs`, and
+The composition is written once, in `scripts/kotoba_kernel_common.cljk`, and
 all three executions drive it.
 
 ### What actually ran, and what it agreed with
@@ -1547,7 +1547,7 @@ amu `02c7e57`. amu has since advanced to `0df9d99`, and at that revision
 `extract-native` rejects *both* kernels with
 `:kotoba/verification-failed "native export table rejected"` — including the
 transform module that had extracted and executed cleanly one revision earlier.
-`scripts/verify-kotoba-kernel.cljs --native` therefore reports
+`scripts/verify-kotoba-kernel.cljk --native` therefore reports
 `NATIVE-aarch64-transform` and `NATIVE-aarch64-quant` as UNVERIFIED and exits
 3 today. It reports them; it does not count them as passes.
 
@@ -1573,15 +1573,15 @@ than four non-zero coefficients, 287 containing negative coefficients,
 coefficients up to 3,584 in magnitude.
 
 ```sh
-nbb --classpath scripts scripts/verify-kotoba-kernel.cljs --amu <amu-checkout>
-nbb --classpath scripts scripts/verify-kotoba-kernel.cljs --amu <amu-checkout> --native
+nbb --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu-checkout>
+nbb --classpath scripts scripts/verify-kotoba-kernel.cljk --amu <amu-checkout> --native
 ```
 
 Exit 0 is a clean pass, 1 is a mismatch, and **3 is UNVERIFIED** — a path that
 could not be run at all, or an evidence floor that was not met. A check that
 could not run must not return the same value as one that ran clean.
 
-`scripts/verify-kotoba-kernel-controls.cljs` is what makes the comparison
+`scripts/verify-kotoba-kernel-controls.cljk` is what makes the comparison
 worth running. It breaks the guest kernels one edit at a time in a throwaway
 copy of the tree — a truncating division where H.264 wants an arithmetic
 shift, a wrong `+32` rounding bias, a dropped `>>1` inside the butterfly, one
@@ -1592,7 +1592,7 @@ the verifier printed only its first three sample failures and the broken table
 happened to fail `level-scale` three times before it reached `ac-qmul`. The
 verifier now prints a `FAILING-GROUPS` line carrying every failing group.
 
-`test/h264/kotoba_kernel_vectors_test.clj` is the other half. The verifier has
+`test/h264/kotoba_kernel_vectors_test.cljk` is the other half. The verifier has
 no JVM, so it cannot ask the decoder anything; it can only compare against a
 file. That test is what makes the file worth comparing against: it re-derives
 every expectation from the current `.cljc` code, re-decodes the fixtures to
