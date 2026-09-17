@@ -20,7 +20,7 @@
       cropping. For those the test also asserts the table-driven reader
       stopped at EXACTLY the bit the writer stopped at — a position check the
       incumbent cannot supply, since it owns a private reader."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.bitstream :as bs]
