@@ -55,11 +55,12 @@
    `h264.decode/blk->col-row` and `h264.transform/luma-dc-hadamard`
    docstrings)."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (deftest flat16-dc-only-golden-vector
   (let [bytes (rd "h264/fixtures/flat16-dc-only.h264")
@@ -213,20 +214,20 @@
      modes. This test used to assert that I_NxN as a whole was rejected; it
      now asserts only what is genuinely still out of scope, and pins the
      reason literal so the refusal cannot quietly become a different one."
-    (let [e (is (thrown? clojure.lang.ExceptionInfo (#'decode/reject-intra-8x8! 100)))]
+    (let [e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (#'decode/reject-intra-8x8! 100)))]
       (is (= "Intra_8x8 (transform_size_8x8_flag) not implemented" (:reason (ex-data e)))))
     (testing "and it refuses for the reason it names: a Baseline stream, where
        transform_8x8_mode_flag cannot be present at all, is NOT refused"
       (is (nil? (#'decode/reject-intra-8x8! 66)))
       (is (nil? (#'decode/reject-intra-8x8! 77)))))
   (testing "mb_type 25 (I_PCM) is out of scope and throws"
-    (let [e (is (thrown? clojure.lang.ExceptionInfo (#'decode/i16x16-mb-info 25)))]
+    (let [e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (#'decode/i16x16-mb-info 25)))]
       (is (= "I_PCM not implemented" (:reason (ex-data e))))))
   (testing "mb_type 0 still throws on the Intra_16x16 path itself — Intra_4x4 is
      reached by dispatch in `decode-macroblock!`, not by this function, and the
      two paths that do NOT dispatch (CABAC I-slices, P-slice intra macroblocks)
      must keep refusing rather than mis-decoding"
-    (let [e (is (thrown? clojure.lang.ExceptionInfo (#'decode/i16x16-mb-info 0)))]
+    (let [e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (#'decode/i16x16-mb-info 0)))]
       (is (= "I_NxN (Intra_4x4) is implemented for CAVLC I-slices only; not for CABAC or P-slice intra macroblocks"
              (:reason (ex-data e)))))))
 

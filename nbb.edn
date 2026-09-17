@@ -9,4 +9,9 @@
         ;; read deps.edn or bb.edn, and the .cljs in this repo are run as
         ;; bare `nbb <file>`. A coordinate they cannot see is not a
         ;; declaration. sha and :paths are COPIED from deps.edn.
-        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}}}
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        ;; The test namespaces require codec-primitives.quant; kbb runs the
+        ;; :test alias on the nbb engine, which reads only this file.
+        io.github.kotoba-lang/codec-primitives
+        {:git/url "https://github.com/kotoba-lang/codec-primitives.git"
+         :git/sha "ffa076057caedcfaabb9645c84e002ee468f8268"}}}

@@ -5,13 +5,14 @@
    must read :cavlc here — an independent correctness signal beyond just
    'the parser didn't throw'."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.bitstream :as bs]
             [h264.rbsp :as rbsp]
             [h264.pps :as pps]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (deftest pps-from-real-encoder
   (let [b     (rd "h264/fixtures/sample.h264")

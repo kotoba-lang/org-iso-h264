@@ -4,13 +4,14 @@
    ... -profile:v baseline -bsf:v h264_mp4toannexb`. `ffprobe` confirms the
    source is 64x48; this test asserts the SPS-derived dimensions match."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.bitstream :as bs]
             [h264.rbsp :as rbsp]
             [h264.sps :as sps]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (deftest sps-from-real-encoder
   (let [b     (rd "h264/fixtures/sample.h264")
@@ -42,13 +43,13 @@
         (is (true? (:frame-mbs-only? parsed)))))))
 
 (deftest encode-rejects-high-profile
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                (sps/encode {:profile-idc 100 :level-idc 30 :width 64 :height 48}))))
 
 (deftest encode-rejects-non-multiple-of-16-dimensions
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                (sps/encode {:profile-idc 66 :level-idc 30 :width 100 :height 48})))
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                (sps/encode {:profile-idc 66 :level-idc 30 :width 64 :height 50}))))
 
 (deftest encode-through-real-nal-wrapping-and-escaping

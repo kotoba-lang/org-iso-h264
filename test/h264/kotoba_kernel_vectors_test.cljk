@@ -14,17 +14,20 @@
   arithmetic ever legitimately changes."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.edn :as edn]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]
             [h264.quant :as quant]
             [h264.transform :as transform]))
 
 (def ^:private vectors
-  (edn/read-string (slurp (io/resource "h264/kotoba-vectors/kernel-vectors.edn"))))
+  (edn/read-string
+   #?(:clj (slurp (io/resource "h264/kotoba-vectors/kernel-vectors.edn"))
+      :cljs (str (.readFileSync (js/require "fs") "resources/h264/kotoba-vectors/kernel-vectors.edn")))))
 
 (defn- rd [p]
   (mapv #(bit-and (int %) 0xff)
-        (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+        #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+           :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (deftest vector-file-is-well-formed
   (is (= :h264.kotoba-kernel-vectors/v1 (:format vectors)))

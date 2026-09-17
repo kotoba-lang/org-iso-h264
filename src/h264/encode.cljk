@@ -210,9 +210,12 @@
    double rather than an exact ratio, and this fn handles both uniformly
    via `mod`, which has floor semantics on both platforms)."
   [x]
-  (let [y (+ (double x) 0.5)
-        f (- y (mod y 1))]
-    #?(:clj (long f) :cljs f)))
+  (let [y (+ (double x) 0.5)]
+    #?(:clj (long (- y (mod y 1)))
+       ;; cljs `mod` has no exact-ratio collapse, so `(- y (mod y 1))` can
+       ;; return the original non-integer double near ties (0.5 - 5.5e-17);
+       ;; round-half must land on the integer the value is nearest.
+       :cljs (js/Math.round (double x)))))
 
 (def ^:private ac-solver-int-cache (atom {}))
 

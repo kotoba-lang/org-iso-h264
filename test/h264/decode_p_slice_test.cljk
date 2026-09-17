@@ -70,11 +70,12 @@
    neighbor is itself a P_Skip macroblock (not another coded inter/intra
    MB) — `decode-p-skip-macroblock!`'s all-zero `:ac-nnz` contribution."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (defn- frame-planes
   "Split a flat yuv420p byte seq (possibly multiple concatenated frames)
