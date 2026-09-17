@@ -20,8 +20,9 @@
       cropping. For those the test also asserts the table-driven reader
       stopped at EXACTLY the bit the writer stopped at — a position check the
       incumbent cannot supply, since it owns a private reader."
-  (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            #?(:clj [clojure.java.io :as io])
             [h264.bitstream :as bs]
             [h264.expgolomb :as eg]
             [h264.rbsp :as rbsp]
@@ -32,7 +33,8 @@
 (def table (spst/load-table))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (defn- agrees?
   "Assert the table-driven parse equals the incumbent parse, whole map."
@@ -59,17 +61,24 @@
 
 (deftest equivalence-across-every-fixture-in-the-repo
   (testing "every .h264 fixture's SPS NALs, not just sample.h264"
-    (let [files (->> (file-seq (io/file (io/resource "h264/fixtures")))
-                     (filter #(.isFile ^java.io.File %))
-                     (filter #(.endsWith (.getName ^java.io.File %) ".h264"))
-                     sort)
+    (let [files (sort
+                 #?(:clj (->> (file-seq (io/file (io/resource "h264/fixtures")))
+                              (filter #(.isFile ^java.io.File %))
+                              (filter #(.endsWith (.getName ^java.io.File %) ".h264")))
+                    :cljs (->> (.readdirSync (js/require "fs") "resources/h264/fixtures"
+                                              #js {:withFileTypes false})
+                               (js->clj)
+                               (filter #(str/ends-with? % ".h264"))
+                               (map #(str "resources/h264/fixtures/" %)))))
           n (atom 0)]
       (is (pos? (count files)) "fixture directory must not be empty")
-      (doseq [^java.io.File f files]
-        (let [b (mapv #(bit-and (int %) 0xff) (.readAllBytes (io/input-stream f)))]
+      (doseq [f files]
+        (let [b (mapv #(bit-and (int %) 0xff)
+                      #?(:clj (.readAllBytes (io/input-stream f))
+                         :cljs (js->clj (.readFileSync (js/require "fs") (str f)))))]
           (doseq [u (filter #(= :sps (:kind %)) (bs/nal-units b))]
             (swap! n inc)
-            (agrees? (rbsp/unescape (:bytes u)) (.getName f)))))
+            (agrees? (rbsp/unescape (:bytes u)) #?(:clj (.getName f) :cljs (last (str/split f #"/")))))))
       ;; evidence floor: a scan that found nothing must not look like a pass
       (is (pos? @n) "SCANNED 0 SPS NALs — this test would otherwise be vacuous")
       (println "  [equivalence] SPS NALs compared across repo fixtures:" @n))))
@@ -250,14 +259,14 @@
     (let [t {:syntax/rows [[:u 8 :header]
                            [:unsupported :ae :mb_type]]}]
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"cannot express"
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"cannot express"
            (syntax/read-bytes [0x67 0x42 0x00] t))))))
 
 (deftest out-of-order-reference-throws-rather-than-seeing-nil
   (testing "a condition on an element not yet read must fail loudly"
     (let [t {:syntax/rows [[:when [:= [:var :never_read] 1] [[:u 1 :x]]]]}]
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"unread syntax element"
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"unread syntax element"
            (syntax/read-bytes [0xff] t))))))
 
 (deftest presence-conditions-must-be-boolean
@@ -265,14 +274,14 @@
     (let [t {:syntax/rows [[:u 1 :flag]
                            [:when [:var :flag] [[:u 1 :y]]]]}]
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"did not evaluate to a boolean"
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"did not evaluate to a boolean"
            (syntax/read-bytes [0x00] t))))))
 
 (deftest missing-escape-handler-throws
   (testing "a table naming an escape the caller did not supply must not silently read zero bits"
     (let [t {:syntax/rows [[:escape :nobody/home]]}]
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"no handler for escape"
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"no handler for escape"
            (syntax/read-bytes [0x00] t))))))
 
 (deftest cross-structure-widths-resolve-from-seeded-context
@@ -288,5 +297,5 @@
           (is (= (+ l2 4) (pos-bits r)))))))
   (testing "without the context the same table refuses rather than reading a wrong width"
     (let [t {:syntax/rows [[:u [:+ [:var :log2_max_frame_num_minus4] 4] :frame_num]]}]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unread syntax element"
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"unread syntax element"
                             (syntax/read-bytes [0xff 0xff] t))))))

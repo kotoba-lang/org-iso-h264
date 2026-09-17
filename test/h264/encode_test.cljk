@@ -33,11 +33,13 @@
    real-AC, Horizontal-prediction test image — decode bit-exact via real
    ffmpeg. No known decode-side gap remains open as of this test suite."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.encode :as encode]
             [h264.decode :as decode]))
 
-(defn- rd [p] (mapv #(bit-and (int %) 0xff) (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd [p] (mapv #(bit-and (int %) 0xff)
+        #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+           :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (defn- sad [a b] (reduce + (map (fn [x y] (let [d (- x y)] (if (neg? d) (- d) d))) a b)))
 
@@ -247,12 +249,15 @@
                          (let [[MacT inv] (@ac-solver qp)]
                            (mapv @round-nearest
                                  (@mat-vec-mul inv (@mat-vec-mul MacT t)))))
-        rng (java.util.Random. 20260730)]
+        rng #?(:clj  (java.util.Random. 20260730)
+               :cljs (let [s  (atom (mod 20260730 2147483648))]
+                       (fn [_n]
+                         (mod (swap! s (fn [v] (mod (+ (* v 1103515245) 12345) 2147483648))) 1024))))]
     (doseq [qp (range 0 52)]
       (testing (str "qp " qp)
         (doseq [t (concat
                    ;; random residuals across the plausible range
-                   (repeatedly 20 #(vec (repeatedly 16 (fn [] (- (.nextInt rng 1024) 512)))))
+                   (repeatedly 20 #(vec (repeatedly 16 (fn [] (let [r #?(:clj (.nextInt rng 1024) :cljs (rng 1024))] (- r 512))))))
                    ;; and the degenerate ones that tend to sit on rounding ties
                    [(vec (repeat 16 0))
                     (vec (repeat 16 255))
@@ -262,8 +267,18 @@
                     (vec (map-indexed (fn [i _] (if (even? i) 512 -512)) (range 16)))
                     (assoc (vec (repeat 16 0)) 0 511)
                     (assoc (vec (repeat 16 0)) 15 -511)])]
-          (is (= (rational-solve qp t) (@solve qp t))
-              (str "levels diverged at qp " qp " for " (pr-str t))))))))
+          #?(:clj (is (= (rational-solve qp t) (@solve qp t))
+                     (str "levels diverged at qp " qp " for " (pr-str t)))
+             ;; cljs: both paths are double-precision (row->int's :cljs
+             ;; branch scales by 2^30; mat-inverse degrades to doubles), so
+             ;; bit-identity is unattainable — tie cases (x.5) can flip by
+             ;; one level from double noise. Assert bounded deviation
+             ;; instead: the folded solve stays within 1 level of the
+             ;; double rational reference.
+             :cljs (is (every? (fn [d] (<= (js/Math.abs d) 1))
+                               (map (fn [r f] (- r f))
+                                    (rational-solve qp t) (@solve qp t)))
+                     (str "levels diverged >1 at qp " qp " for " (pr-str t)))))))))
 
 (deftest ^:parallel folded-regular-solve-is-bit-identical-to-the-rational-one
   ;; The same fold, on the INTER (regular, all-16-position) solver — which was
@@ -284,11 +299,14 @@
                          (let [[MT inv] (@regular-solver qp)]
                            (mapv @round-nearest
                                  (@mat-vec-mul inv (@mat-vec-mul MT t)))))
-        rng (java.util.Random. 20260731)]
+        rng #?(:clj  (java.util.Random. 20260731)
+               :cljs (let [s  (atom (mod 20260731 2147483648))]
+                       (fn [_n]
+                         (mod (swap! s (fn [v] (mod (+ (* v 1103515245) 12345) 2147483648))) 1024))))]
     (doseq [qp (range 0 52)]
       (testing (str "qp " qp)
         (doseq [t (concat
-                   (repeatedly 20 #(vec (repeatedly 16 (fn [] (- (.nextInt rng 1024) 512)))))
+                   (repeatedly 20 #(vec (repeatedly 16 (fn [] (let [r #?(:clj (.nextInt rng 1024) :cljs (rng 1024))] (- r 512))))))
                    [(vec (repeat 16 0))
                     (vec (repeat 16 255))
                     (vec (repeat 16 -255))
@@ -297,8 +315,18 @@
                     (vec (map-indexed (fn [i _] (if (even? i) 512 -512)) (range 16)))
                     (assoc (vec (repeat 16 0)) 0 511)
                     (assoc (vec (repeat 16 0)) 15 -511)])]
-          (is (= (rational-solve qp t) (@solve qp t))
-              (str "levels diverged at qp " qp " for " (pr-str t))))))))
+          #?(:clj (is (= (rational-solve qp t) (@solve qp t))
+                     (str "levels diverged at qp " qp " for " (pr-str t)))
+             ;; cljs: both paths are double-precision (row->int's :cljs
+             ;; branch scales by 2^30; mat-inverse degrades to doubles), so
+             ;; bit-identity is unattainable — tie cases (x.5) can flip by
+             ;; one level from double noise. Assert bounded deviation
+             ;; instead: the folded solve stays within 1 level of the
+             ;; double rational reference.
+             :cljs (is (every? (fn [d] (<= (js/Math.abs d) 1))
+                               (map (fn [r f] (- r f))
+                                    (rational-solve qp t) (@solve qp t)))
+                     (str "levels diverged >1 at qp " qp " for " (pr-str t)))))))))
 
 (deftest ^:parallel folded-regular-solve-keeps-the-accumulator-inside-a-long
   ;; The same check as the intra fold's, but the bound had to be MEASURED for
@@ -324,12 +352,12 @@
       (is (pos? den) (str "denominator must be positive at qp " qp))
       (is (= 16 (count num)))
       (swap! worst max (* 2 16 512 (apply max (map #(abs (long %)) num)))))
-    (is (< @worst (bit-shift-left 1 62))
+    (is (< @worst #?(:clj (bit-shift-left 1 62) :cljs (js/Math.pow 2 62)))
         (str "worst accumulator " @worst " must stay inside a long"))
-    (is (< @worst (bit-shift-left 1 53))
+    (is (< @worst #?(:clj (bit-shift-left 1 53) :cljs (js/Math.pow 2 53)))
         (str "worst accumulator " @worst " also fits a cljs double's mantissa, "
              "unlike the AC path's — do not let that regress silently"))
-    (is (>= @worst (bit-shift-left 1 30))
+    (is (>= @worst #?(:clj (bit-shift-left 1 30) :cljs (js/Math.pow 2 30)))
         (str "worst accumulator " @worst " dropped far below the measured "
              "~2^34 — the matrix or the fold changed, re-derive the bound"))))
 
@@ -353,8 +381,13 @@
       (is (= 16 (count num)))
       ;; 16 terms, |target| bounded by 512, doubled by round-div
       (swap! worst max (* 2 16 512 (apply max (map #(abs (long %)) num)))))
-    (is (< @worst (bit-shift-left 1 62))
+    (is (< @worst #?(:clj (bit-shift-left 1 62) :cljs (js/Math.pow 2 62)))
         (str "worst accumulator " @worst " must stay inside a long"))
-    (is (>= @worst (bit-shift-left 1 50))
-        (str "if this drops far below 2^50 the bound above stopped being "
-             "load-bearing and the docstring's 54-bit claim is stale"))))
+    #?(:clj (is (>= @worst (bit-shift-left 1 50))
+                (str "if this drops far below 2^50 the bound above stopped being "
+                     "load-bearing and the docstring's 54-bit claim is stale"))
+       ;; cljs numbers are ~2^43 by construction (row->int scales doubles
+       ;; by 2^30), so the JVM's 2^50 floor does not apply here.
+       :cljs (is (>= @worst (js/Math.pow 2 40))
+                 (str "cljs worst accumulator " @worst " dropped below the "
+                      "expected ~2^43 scale — the 2^30 scaling changed")))))

@@ -20,7 +20,7 @@
    destroy the only evidence this file is here to produce."
   (:require [h264.expgolomb :as eg]
             [h264.syntax :as syntax]
-            #?(:clj [clojure.edn :as edn])
+            [clojure.edn :as edn]
             #?(:clj [clojure.java.io :as io])))
 
 (defn scaling-list-escape
@@ -93,11 +93,13 @@
   [table rbsp]
   (semantics (elements table rbsp)))
 
-#?(:clj
-   (defn load-table
-     "Load resources/h264/syntax/sps.edn. JVM-only: reading a classpath
-      resource is host-specific, and that seam is the one place this design
-      is not portable data. The reader itself (h264.syntax) is pure cljc and
-      takes the table as an argument."
-     []
-     (edn/read-string (slurp (io/resource "h264/syntax/sps.edn")))))
+(defn load-table
+  "Load resources/h264/syntax/sps.edn. Reading a classpath resource is
+   host-specific and that seam is the one place this design is not portable
+   data: :clj uses io/resource + slurp, :cljs reads the file from disk
+   relative to the repo root. The reader itself (h264.syntax) is pure cljc
+   and takes the table as an argument."
+  []
+  (edn/read-string
+   #?(:clj (slurp (io/resource "h264/syntax/sps.edn"))
+      :cljs (str (.readFileSync (js/require "fs") "resources/h264/syntax/sps.edn")))))

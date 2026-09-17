@@ -84,9 +84,13 @@
 
 (deftest matches-min-key-on-textured-content
   (testing "the fused search picks the same vector as apply min-key over materialised blocks"
-    (let [rnd (java.util.Random. 20260730)
-          ref-plane (plane w h (fn [_ _] (.nextInt rnd 256)))
-          src-plane (plane w h (fn [_ _] (.nextInt rnd 256)))
+    (let [rnd #?(:clj  (java.util.Random. 20260730)
+                 :cljs (let [s (atom (mod 20260730 2147483648))]
+                         (fn [_n]
+                           (mod (swap! s (fn [v] (mod (+ (* v 1103515245) 12345) 2147483648))) 256))))
+          next-int #?(:clj (fn [n] (.nextInt rnd n)) :cljs rnd)
+          ref-plane (plane w h (fn [_ _] (next-int 256)))
+          src-plane (plane w h (fn [_ _] (next-int 256)))
           rf (ref-frame-of ref-plane)]
       (doseq [mb-y (range 2 4) mb-x (range 2 4)]
         (let [src (grid-16 src-plane w (* mb-x 16) (* mb-y 16))

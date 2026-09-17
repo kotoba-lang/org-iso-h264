@@ -81,11 +81,12 @@
    fixture's `[6 10]` MB), and \"average of two half-samples\" (fx=1/3,
    fy=1/3 — the diagonal fixture's `[13 7]` MB, fx=1,fy=3)."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "resources/" p))))))
 
 (defn- frame-planes
   [yuv offset width height]
