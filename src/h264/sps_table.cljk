@@ -20,7 +20,7 @@
    destroy the only evidence this file is here to produce."
   (:require [h264.expgolomb :as eg]
             [h264.syntax :as syntax]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             #?(:clj [clojure.java.io :as io])))
 
 (defn scaling-list-escape
