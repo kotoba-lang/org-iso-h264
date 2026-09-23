@@ -85,7 +85,7 @@
    default mismatch by comparing motion-compensation-only reconstruction
    (verified correct) against the full (residual-included) reconstruction
    (verified WRONG) for the first two real macroblocks."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 

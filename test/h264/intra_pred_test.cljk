@@ -1,5 +1,5 @@
 (ns h264.intra-pred-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.intra-pred :as intra-pred]))
 
 (deftest dc-mode-no-neighbors-defaults-128

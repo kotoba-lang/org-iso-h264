@@ -48,7 +48,7 @@
       own `h264.decode/decode-gop` output for both frames, luma AND chroma —
       a genuine independent-decoder cross-check (ffmpeg never saw or
       trusted anything about how these bytes were constructed)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.encode :as encode]
             [h264.decode :as decode]))

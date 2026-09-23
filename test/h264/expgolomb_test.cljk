@@ -2,7 +2,7 @@
   "Encode-side (write-ue!/write-se!/write-bits!) round-trip against the
    existing decode-side reader — this is the strongest correctness signal
    available without a reference encoder/decoder to compare against."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.expgolomb :as eg]))
 
 (defn- ue-roundtrip [v]

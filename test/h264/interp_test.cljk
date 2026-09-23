@@ -6,7 +6,7 @@
    expected values, independent of the bitstream/CAVLC machinery) —
    `test/h264/decode_p_subpel_test.cljk` covers the end-to-end (real +
    hand-authored) golden-vector cross-checks against real ffmpeg."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.interp :as interp]))
 
 (deftest quarter-pel-luma-integer-position-is-a-plain-sample

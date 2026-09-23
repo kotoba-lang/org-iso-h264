@@ -2,7 +2,7 @@
   "escape/unescape round-trip, including cases specifically constructed to
    trigger emulation-prevention byte insertion (the commonly-gotten-wrong
    part of the spec)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.rbsp :as rbsp]))
 
 (deftest escape-triggers-on-00-00-0..3

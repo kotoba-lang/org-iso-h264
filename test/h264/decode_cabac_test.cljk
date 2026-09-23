@@ -76,7 +76,7 @@
    entropy decode's CONTROL FLOW (which bins, in what order, against which
    contexts) was already correct, narrowing the bug to the one arithmetic
    combination step that was actually wrong."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 

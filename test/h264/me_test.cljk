@@ -21,7 +21,7 @@
    The reference implementation below is deliberately written out in full rather
    than reusing anything from `h264.encode`, so it cannot drift along with the
    code it is checking."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.encode :as encode]
             [h264.interp :as interp]))
 

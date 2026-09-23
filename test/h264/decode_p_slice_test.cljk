@@ -69,7 +69,7 @@
    cross-macroblock CAVLC neighbor (`nC`) derivation where the LEFT
    neighbor is itself a P_Skip macroblock (not another coded inter/intra
    MB) — `decode-p-skip-macroblock!`'s all-zero `:ac-nnz` contribution."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 
