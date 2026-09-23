@@ -4,7 +4,7 @@
    P-slice encode increment) against the real, already-tested
    `parse-header!` — the same discipline `h264.cavlc-test` uses for CAVLC
    encode."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.slice :as slice]
             [h264.expgolomb :as eg]))
 

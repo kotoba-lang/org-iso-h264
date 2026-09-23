@@ -1,5 +1,5 @@
 (ns h264.transform-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.transform :as transform]
             [h264.quant :as quant]
             [codec-primitives.transform :as cp-transform]

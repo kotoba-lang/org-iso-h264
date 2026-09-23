@@ -1,5 +1,5 @@
 (ns h264.bitstream-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.bitstream :as bs]
             [h264.rbsp :as rbsp]
             [h264.sps :as sps]

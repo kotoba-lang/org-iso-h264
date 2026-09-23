@@ -21,7 +21,7 @@
       stopped at EXACTLY the bit the writer stopped at — a position check the
       incumbent cannot supply, since it owns a private reader."
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.bitstream :as bs]
             [h264.expgolomb :as eg]

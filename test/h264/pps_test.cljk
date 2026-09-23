@@ -4,7 +4,7 @@
    cross-check: baseline profile forbids CABAC by spec, so a correct parse
    must read :cavlc here — an independent correctness signal beyond just
    'the parser didn't throw'."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.bitstream :as bs]
             [h264.rbsp :as rbsp]

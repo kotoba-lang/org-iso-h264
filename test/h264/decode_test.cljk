@@ -54,7 +54,7 @@
    Fixes a real desync/wrong-pixel bug this repo shipped with (see
    `h264.decode/blk->col-row` and `h264.transform/luma-dc-hadamard`
    docstrings)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]))
 

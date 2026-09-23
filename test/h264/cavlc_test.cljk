@@ -7,7 +7,7 @@
    and asserts the decoded `:coeffs`/`:total-coeff` reproduce the input
    exactly. This is the same empirical-verification discipline the decode
    side's README documents using throughout."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [h264.cavlc :as cavlc]
             [h264.expgolomb :as eg]))
 

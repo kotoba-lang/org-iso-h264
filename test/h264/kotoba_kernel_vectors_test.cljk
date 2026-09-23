@@ -12,7 +12,7 @@
 
   Regenerate with `scripts/gen_kernel_vectors.cljk` if the decoder's
   arithmetic ever legitimately changes."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.lang.edn :as edn]
             #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]

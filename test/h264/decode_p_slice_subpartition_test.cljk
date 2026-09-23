@@ -81,7 +81,7 @@
    per-quadrant chroma motion-compensated placement
    (`h264.decode/mc-predict-quadrants`) is genuinely exercised too, not
    just luma."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             #?(:clj [clojure.java.io :as io])
             [h264.decode :as decode]
             [h264.expgolomb :as eg]
