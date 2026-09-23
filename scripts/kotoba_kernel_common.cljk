@@ -4,7 +4,7 @@
   `kotoba-kernel-reference.cljs` (kotoba.kir interpreter) drive the SAME
   composition here, so the three executions differ only in how a single
   1-D call is dispatched."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             ["node:fs" :as fs]))
 
 (def vectors-format :h264.kotoba-kernel-vectors/v1)
