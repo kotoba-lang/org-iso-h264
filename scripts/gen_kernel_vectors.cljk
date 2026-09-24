@@ -8,7 +8,7 @@
 
       kbb -M:test -m gen-kernel-vectors"
   (:require [clojure.java.io :as io]
-            [clojure.pprint :as pprint]
+            [kotoba.pprint :as pprint]
             [h264.decode :as decode]
             [h264.quant :as quant]
             [h264.transform :as transform]))
