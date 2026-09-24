@@ -25,7 +25,7 @@
                   :main-opts ["-m" "cognitect.test-runner"]}
   :kotoba {:extra-deps {io.github.kotoba-lang/amu
                         {:git/url "https://github.com/kotoba-lang/amu.git"
-                         :git/sha "3579cfdb4975458eb0f434052564cd523d8a03da"}}
+                         :git/sha "203a957efa36c6eadd6b9f523266dd6f4e46f513"}}
            :main-opts ["-m" "kotoba.compiler.cli"]}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
