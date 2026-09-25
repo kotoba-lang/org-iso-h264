@@ -259,14 +259,14 @@
     (let [t {:syntax/rows [[:u 8 :header]
                            [:unsupported :ae :mb_type]]}]
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"cannot express"
+           js/Error #"cannot express"
            (syntax/read-bytes [0x67 0x42 0x00] t))))))
 
 (deftest out-of-order-reference-throws-rather-than-seeing-nil
   (testing "a condition on an element not yet read must fail loudly"
     (let [t {:syntax/rows [[:when [:= [:var :never_read] 1] [[:u 1 :x]]]]}]
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"unread syntax element"
+           js/Error #"unread syntax element"
            (syntax/read-bytes [0xff] t))))))
 
 (deftest presence-conditions-must-be-boolean
@@ -274,14 +274,14 @@
     (let [t {:syntax/rows [[:u 1 :flag]
                            [:when [:var :flag] [[:u 1 :y]]]]}]
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"did not evaluate to a boolean"
+           js/Error #"did not evaluate to a boolean"
            (syntax/read-bytes [0x00] t))))))
 
 (deftest missing-escape-handler-throws
   (testing "a table naming an escape the caller did not supply must not silently read zero bits"
     (let [t {:syntax/rows [[:escape :nobody/home]]}]
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"no handler for escape"
+           js/Error #"no handler for escape"
            (syntax/read-bytes [0x00] t))))))
 
 (deftest cross-structure-widths-resolve-from-seeded-context
@@ -297,5 +297,5 @@
           (is (= (+ l2 4) (pos-bits r)))))))
   (testing "without the context the same table refuses rather than reading a wrong width"
     (let [t {:syntax/rows [[:u [:+ [:var :log2_max_frame_num_minus4] 4] :frame_num]]}]
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"unread syntax element"
+      (is (thrown-with-msg? js/Error #"unread syntax element"
                             (syntax/read-bytes [0xff 0xff] t))))))

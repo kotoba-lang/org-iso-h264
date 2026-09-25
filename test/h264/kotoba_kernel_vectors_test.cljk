@@ -14,7 +14,7 @@
   arithmetic ever legitimately changes."
   (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.lang.edn :as edn]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.decode :as decode]
             [h264.quant :as quant]
             [h264.transform :as transform]))

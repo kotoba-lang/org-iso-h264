@@ -81,7 +81,7 @@
    fixture's `[6 10]` MB), and \"average of two half-samples\" (fx=1/3,
    fy=1/3 — the diagonal fixture's `[13 7]` MB, fx=1,fy=3)."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)

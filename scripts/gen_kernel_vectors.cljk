@@ -7,7 +7,7 @@
   decoded — not a value anyone invented. Run with:
 
       kbb -M:test -m gen-kernel-vectors"
-  (:require [clojure.java.io :as io]
+  (:require [kotoba.io :as io]
             [kotoba.pprint :as pprint]
             [h264.decode :as decode]
             [h264.quant :as quant]
@@ -82,6 +82,6 @@
         out (io/file "resources/h264/kotoba-vectors/kernel-vectors.edn")]
     (io/make-parents out)
     (spit out (with-out-str (pprint/pprint data)))
-    (println "wrote" (.getPath out)
+    (println "wrote" (io/path out)
              "idct-cases" (count (:idct data))
              "quant-groups" (count (:quant data)))))

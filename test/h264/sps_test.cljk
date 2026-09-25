@@ -4,7 +4,7 @@
    ... -profile:v baseline -bsf:v h264_mp4toannexb`. `ffprobe` confirms the
    source is 64x48; this test asserts the SPS-derived dimensions match."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.bitstream :as bs]
             [h264.rbsp :as rbsp]
             [h264.sps :as sps]))
@@ -43,13 +43,13 @@
         (is (true? (:frame-mbs-only? parsed)))))))
 
 (deftest encode-rejects-high-profile
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (sps/encode {:profile-idc 100 :level-idc 30 :width 64 :height 48}))))
 
 (deftest encode-rejects-non-multiple-of-16-dimensions
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (sps/encode {:profile-idc 66 :level-idc 30 :width 100 :height 48})))
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (sps/encode {:profile-idc 66 :level-idc 30 :width 64 :height 50}))))
 
 (deftest encode-through-real-nal-wrapping-and-escaping

@@ -49,7 +49,7 @@
       a genuine independent-decoder cross-check (ffmpeg never saw or
       trusted anything about how these bytes were constructed)."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.encode :as encode]
             [h264.decode :as decode]))
 

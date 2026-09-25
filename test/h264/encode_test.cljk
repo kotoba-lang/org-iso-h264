@@ -33,7 +33,7 @@
    real-AC, Horizontal-prediction test image — decode bit-exact via real
    ffmpeg. No known decode-side gap remains open as of this test suite."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.encode :as encode]
             [h264.decode :as decode]))
 

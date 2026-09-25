@@ -82,7 +82,7 @@
    (`h264.decode/mc-predict-quadrants`) is genuinely exercised too, not
    just luma."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.decode :as decode]
             [h264.expgolomb :as eg]
             [h264.slice :as slice]
@@ -228,7 +228,7 @@
           _ (eg/write-ue! writer 0)  ; mb_skip_run
           _ (eg/write-ue! writer 4) ; mb_type = 4 (P_8x8ref0)
           bytes (finish-p-nal idr-bytes writer)]
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"P_8x8ref0"
+      (is (thrown-with-msg? js/Error #"P_8x8ref0"
                             (decode/decode-gop bytes))))))
 
 (deftest p-8x8-unsupported-sub-mb-type-throws
@@ -241,5 +241,5 @@
           _ (eg/write-ue! writer 0) ; sub_mb_type[2]
           _ (eg/write-ue! writer 0) ; sub_mb_type[3]
           bytes (finish-p-nal idr-bytes writer)]
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"sub_mb_type P_L0_8x8"
+      (is (thrown-with-msg? js/Error #"sub_mb_type P_L0_8x8"
                             (decode/decode-gop bytes))))))

@@ -86,7 +86,7 @@
    (verified correct) against the full (residual-included) reconstruction
    (verified WRONG) for the first two real macroblocks."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)
