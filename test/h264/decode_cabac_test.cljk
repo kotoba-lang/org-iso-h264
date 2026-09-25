@@ -77,7 +77,7 @@
    contexts) was already correct, narrowing the bug to the one arithmetic
    combination step that was actually wrong."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)

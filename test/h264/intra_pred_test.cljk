@@ -24,7 +24,7 @@
 
 (deftest vertical-mode-throws-without-top-neighbor
   (testing "Vertical mode without an available top neighbor throws (a conformant encoder never selects it here)"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (intra-pred/predict-16x16 0 {:top-available? false})))))
 
 (deftest horizontal-mode-copies-left-col
@@ -35,6 +35,6 @@
 
 (deftest plane-mode-unsupported
   (testing "mode 3 (Plane) is out of scope and throws"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (intra-pred/predict-16x16 3 {:top-available? true :left-available? true
                                                :top-row (vec (repeat 16 0)) :left-col (vec (repeat 16 0))})))))

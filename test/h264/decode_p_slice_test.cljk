@@ -70,7 +70,7 @@
    neighbor is itself a P_Skip macroblock (not another coded inter/intra
    MB) — `decode-p-skip-macroblock!`'s all-zero `:ac-nnz` contribution."
   (:require [kotoba.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             [h264.decode :as decode]))
 
 (defn- rd [p] (mapv #(bit-and (int %) 0xff)

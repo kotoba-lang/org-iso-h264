@@ -21,7 +21,7 @@
   (:require [h264.expgolomb :as eg]
             [h264.syntax :as syntax]
             [kotoba.lang.edn :as edn]
-            #?(:clj [clojure.java.io :as io])))
+            #?(:clj [kotoba.io :as io])))
 
 (defn scaling-list-escape
   "ISO/IEC 14496-10 §7.3.2.1.1.1 scaling_list( ). Consumes the right number
