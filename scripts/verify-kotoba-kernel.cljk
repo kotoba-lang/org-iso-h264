@@ -213,7 +213,7 @@
 
 (defn reference-result []
   (let [nbb (.join path amu-root "node_modules" ".bin" "nbb")
-        printer (.join path amu-root "scripts" "print-classpath.cljs")]
+        printer (.join path amu-root "scripts" "print-classpath.cljk")]
     (if-not (and (fs/existsSync nbb) (fs/existsSync printer))
       {:state :unverified :why "amu's nbb or print-classpath.cljs is missing"}
       (let [cp (run nbb ["--classpath" (.join path amu-root "src") printer amu-root])]
