@@ -84,7 +84,7 @@
                (fs/writeFileSync target (str/replace source from to))
                (let [r (.spawnSync child "nbb"
                                    #js ["--classpath" (.join path dir "scripts")
-                                        (.join path dir "scripts" "verify-kotoba-kernel.cljs")
+                                        (.join path dir "scripts" "verify-kotoba-kernel.cljk")
                                         "--amu" amu-root "--skip-reference"]
                                    #js {:cwd dir :encoding "utf8" :maxBuffer 16777216})
                      out (str (.-stdout r) (.-stderr r))
